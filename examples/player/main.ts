@@ -35,6 +35,7 @@ import {
     type CmafStartupGeometry,
     CmafAssembler,
     createWebTransport,
+    DrmSessionCache,
 } from '@openmoq/browser';
 
 import type { PlayerEventMap, PlayerStats, TTFFBreakdown, CatalogSelection, SelectionConfig } from '@openmoq/player';
@@ -235,6 +236,9 @@ let pendingVideoSelection: object | null = null;
 let player: MoqtPlayer | null = null;
 /** Adapter handle for the current session (diagnostics + playback recovery). */
 let mediaSourceRef: MseMediaSource | null = null;
+// One DRM session cache for the page, so a restart or switch to a broadcast
+// whose keys are already licensed reuses that license.
+const drmSessionCache = new DrmSessionCache();
 /**
  * Two-source latch for the joined startup summary (diagnostics only).
  *
@@ -1307,7 +1311,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
-                ...(licenseUrl ? { drmConfig: { licenseUrl } } : {}),
+                ...(licenseUrl ? { drmConfig: { licenseUrl, sessionCache: drmSessionCache } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
