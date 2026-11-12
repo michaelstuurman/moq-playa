@@ -22,6 +22,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { format } from 'node:util';
 import { MseMediaSource } from './mse-adapter.js';
 import { CmafAssembler } from './cmaf-assembler.js';
+import { DrmSessionCache, initDataKeyIds } from './drm-session-cache.js';
 import type { DrmConfig, MseStartupReport, MseMediaSourceOptions } from './mse-adapter.js';
 
 // ─── Shared byte-building helpers (subset from mp4-box.test.ts) ──
@@ -3805,6 +3806,12 @@ describe('MseMediaSource DRM lifecycle', () => {
         generateRequest = vi.fn(async (_type: string, _data: BufferSource) => {});
         update = vi.fn(async (_data: BufferSource) => {});
         close = vi.fn(async () => { this.finishClose(); });
+        keyStatuses = new Map<ArrayBuffer, string>();
+        /** Report one key's status, as the CDM does after update() or expiry. */
+        setStatus(kid: number, status: string): void {
+            this.keyStatuses = new Map([[new Uint8Array(16).fill(kid).buffer, status]]);
+            this.dispatch({ type: 'keystatuseschange', target: this } as unknown as Event);
+        }
     }
 
     const adapters: MseMediaSource[] = [];
@@ -3822,7 +3829,7 @@ describe('MseMediaSource DRM lifecycle', () => {
         return { promise, resolve };
     }
 
-    function setup(serverCertificate?: Uint8Array, deferAccess?: Promise<unknown>) {
+    function setup(serverCertificate?: Uint8Array, deferAccess?: Promise<unknown>, drm: Partial<DrmConfig> = {}) {
         const sessions: KeySession[] = [];
         const keys = {
             createSession: vi.fn(() => {
@@ -3849,7 +3856,7 @@ describe('MseMediaSource DRM lifecycle', () => {
             adapters.push(adapter);
             return adapter;
         };
-        const adapter = reconnect();
+        const adapter = reconnect(drm);
         const encrypted = async (id: number, initDataType = 'cenc') => {
             video.dispatch({
                 type: 'encrypted', initDataType, initData: Uint8Array.of(id).buffer,
@@ -4176,6 +4183,165 @@ describe('MseMediaSource DRM lifecycle', () => {
         await settle();
         expect(sessions[0]!.update).not.toHaveBeenCalled();
         expect(signal?.aborted).toBe(true);
+    });
+
+    describe('with a session cache', () => {
+        /** Version-1 PSSH naming one key ID of sixteen `kid` bytes. */
+        function pssh(kid: number): Uint8Array {
+            return cat(u32(52), Uint8Array.from('pssh', (c) => c.charCodeAt(0)), Uint8Array.of(1, 0, 0, 0),
+                new Uint8Array(16).fill(0x10), u32(1), new Uint8Array(16).fill(kid), u32(0));
+        }
+
+        function cached(options?: ConstructorParameters<typeof DrmSessionCache>[0]) {
+            const cache = new DrmSessionCache(options);
+            const env = setup(undefined, undefined, { sessionCache: cache });
+            const fetchLicense = vi.fn(async (_url: string, _init: RequestInit) => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) }));
+            vi.stubGlobal('fetch', fetchLicense);
+            const encryptedKid = async (kid: number) => {
+                env.video.dispatch({ type: 'encrypted', initDataType: 'cenc', initData: pssh(kid).buffer } as unknown as Event);
+                await settle();
+            };
+            /** Encrypted event, license round trip, key usable. Returns the session. */
+            const license = async (kid: number) => {
+                await encryptedKid(kid);
+                const session = env.sessions.at(-1)!;
+                env.message(session);
+                await settle();
+                session.setStatus(kid, 'usable');
+                return session;
+            };
+            const connect = (overrides: Partial<DrmConfig> = {}) => env.reconnect({ sessionCache: cache, ...overrides });
+            return { ...env, cache, fetchLicense, encryptedKid, license, connect };
+        }
+
+        it('returning to a licensed key ID reuses its session without a license request', async () => {
+            const { adapter, cache, connect, license, encryptedKid, fetchLicense, sessions, message, requestAccess, video } = cached();
+            const a = await license(0xa);
+            adapter.destroy();
+            const b = connect();
+            await license(0xb);
+            b.destroy();
+            connect();
+            await encryptedKid(0xa);
+            expect(sessions).toHaveLength(2);
+            expect(a.generateRequest).toHaveBeenCalledTimes(1);
+            expect(fetchLicense).toHaveBeenCalledTimes(2);
+            expect(a.close).not.toHaveBeenCalled();
+            expect(requestAccess).toHaveBeenCalledTimes(1);
+            expect(video.setMediaKeys).toHaveBeenCalledTimes(1);
+            // The new holder answers renewals again.
+            message(a);
+            await settle();
+            expect(fetchLicense).toHaveBeenCalledTimes(3);
+            expect(a.update).toHaveBeenCalledTimes(2);
+            cache.close();
+        });
+
+        it.each(['idle', 'held'] as const)('a key expiring while %s closes its session and the next initialization requests a fresh license', async (when) => {
+            const { adapter, connect, license, encryptedKid, fetchLicense, sessions } = cached();
+            const a = await license(0xa);
+            if (when === 'idle') adapter.destroy();
+            a.setStatus(0xa, 'expired');
+            await settle();
+            expect(a.close).toHaveBeenCalledTimes(1);
+            if (when === 'held') adapter.destroy();
+            connect();
+            await encryptedKid(0xa);
+            expect(sessions).toHaveLength(2);
+            expect(sessions[1]!.generateRequest).toHaveBeenCalledTimes(1);
+            expect(fetchLicense).toHaveBeenCalledTimes(1);
+        });
+
+        it('never reuses keys or sessions licensed through another license URL', async () => {
+            const { adapter, access, keys, connect, license, fetchLicense, sessions, requestAccess, video } = cached();
+            const a = await license(0xa);
+            adapter.destroy();
+            const other = { ...keys };
+            access.createMediaKeys.mockResolvedValueOnce(other);
+            connect({ licenseUrl: 'https://other.example.invalid/' });
+            await license(0xa);
+            expect(sessions).toHaveLength(2);
+            expect(requestAccess).toHaveBeenCalledTimes(2);
+            expect(video.setMediaKeys).toHaveBeenCalledTimes(2);
+            expect(video.mediaKeys).toBe(other);
+            expect(fetchLicense.mock.calls.map(([url]) => url)).toEqual(['https://license.example.invalid/', 'https://other.example.invalid/']);
+            expect(a.close).not.toHaveBeenCalled();
+        });
+
+        it('closing the cache closes held and idle sessions and refuses later adapters', async () => {
+            const { adapter, cache, connect, license, sessions } = cached();
+            await license(0xa);
+            adapter.destroy();
+            const b = connect();
+            await license(0xb);
+            cache.close();
+            await settle();
+            for (const session of sessions) expect(session.close).toHaveBeenCalledTimes(1);
+            b.destroy();
+            expect(sessions[1]!.close).toHaveBeenCalledTimes(1);
+            const late = connect();
+            const onError = vi.fn();
+            late.onError = onError;
+            await settle();
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0]![0].message).toContain('closed');
+        });
+
+        it('closes a session that was not yet licensed when its adapter is destroyed', async () => {
+            const { adapter, connect, encryptedKid, sessions } = cached();
+            await encryptedKid(0xa);
+            adapter.destroy();
+            expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
+            connect();
+            await encryptedKid(0xa);
+            expect(sessions).toHaveLength(2);
+        });
+
+        it('an idle session closes on a renewal message instead of requesting a license', async () => {
+            const { adapter, license, fetchLicense, message } = cached();
+            const a = await license(0xa);
+            adapter.destroy();
+            message(a);
+            await settle();
+            expect(fetchLicense).toHaveBeenCalledTimes(1);
+            expect(a.close).toHaveBeenCalledTimes(1);
+        });
+
+        it('evicts the least recently used idle session beyond the bound', async () => {
+            const { adapter, connect, license, sessions } = cached({ maxSessions: 1 });
+            await license(0xa);
+            adapter.destroy();
+            connect();
+            await license(0xb);
+            expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
+            expect(sessions[1]!.close).not.toHaveBeenCalled();
+        });
+
+        it('a replacement adapter takes over a held session; the previous holder no longer closes it', async () => {
+            const { adapter, connect, license, encryptedKid, sessions, fetchLicense } = cached();
+            const a = await license(0xa);
+            connect();
+            await encryptedKid(0xa);
+            adapter.destroy();
+            expect(sessions).toHaveLength(1);
+            expect(fetchLicense).toHaveBeenCalledTimes(1);
+            expect(a.close).not.toHaveBeenCalled();
+        });
+
+        it('rejects a non-positive session bound', () => {
+            expect(() => new DrmSessionCache({ maxSessions: 0 })).toThrow(RangeError);
+        });
+
+        it('reads key IDs from version-1 and Widevine version-0 PSSH boxes, and none from malformed data', () => {
+            const kid = new Uint8Array(16).fill(0xab);
+            const widevine = cat(Uint8Array.of(0x08, 0x01, 0x12, 16), kid, Uint8Array.of(0x22, 2, 0x61, 0x62));
+            const v0 = cat(u32(32 + widevine.length), Uint8Array.from('pssh', (c) => c.charCodeAt(0)), Uint8Array.of(0, 0, 0, 0),
+                Uint8Array.of(0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce, 0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed),
+                u32(widevine.length), widevine);
+            expect([...initDataKeyIds('cenc', cat(pssh(0x01), v0))]).toEqual(['01'.repeat(16), 'ab'.repeat(16)]);
+            expect(initDataKeyIds('cenc', pssh(0x01).subarray(0, 40)).size).toBe(0);
+            expect(initDataKeyIds('keyids', pssh(0x01)).size).toBe(0);
+        });
     });
 
     it('surfaces license failures and releases the failed session', async () => {

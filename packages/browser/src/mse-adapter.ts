@@ -27,6 +27,7 @@ import {
 } from './mp4-box.js';
 import { TimelineIndex } from './timeline-index.js';
 import { mediaTrackIdentity } from './media-track-identity.js';
+import { drmPartition, type DrmCachedSession, type DrmSessionCache } from './drm-session-cache.js';
 
 interface AppendEntry {
   data: Uint8Array; trackName: string; trackIdentity: string; sourceKey?: string;
@@ -254,6 +255,12 @@ export interface DrmConfig {
   readonly keySystem?: string;
   /** Optional license-server certificate passed to the CDM. */
   readonly serverCertificate?: Uint8Array;
+  /**
+   * Opt-in retention of MediaKeys and usable sessions beyond this adapter.
+   * The caller owns its lifetime and closes it with the player. Without it,
+   * every adapter requests its own licenses and closes them on destroy().
+   */
+  readonly sessionCache?: DrmSessionCache;
 }
 
 interface DrmElementState {
@@ -261,13 +268,29 @@ interface DrmElementState {
   keys: MediaKeys | null;
   keySystem: string | null;
   certificate: Uint8Array | undefined;
+  /** Attached keys belong to a session cache: never reused by an uncached adapter. */
+  cached: boolean;
 }
 
 interface DrmSessionState {
   initDataType: string;
   initData: Uint8Array;
   abort: AbortController;
+  /** Cache entry and this adapter's revocation token for it, when retained. */
+  cached: { entry: DrmCachedSession; revoke: () => void } | null;
 }
+
+/** Fixed EME access request; reuse across adapters assumes it never varies. */
+const DRM_ACCESS_CONFIG: MediaKeySystemConfiguration[] = [{
+  initDataTypes: ['cenc'],
+  videoCapabilities: [
+    { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
+    { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
+  ],
+  audioCapabilities: [
+    { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
+  ],
+}];
 
 function equalDrmBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
   if (a === b) return true;
@@ -1068,7 +1091,7 @@ export class MseMediaSource implements MediaSourceLike {
       const config = this.drmConfig;
       let state = MseMediaSource.drmElements.get(this.video);
       if (!state) {
-        state = { ready: Promise.resolve(), keys: null, keySystem: null, certificate: undefined };
+        state = { ready: Promise.resolve(), keys: null, keySystem: null, certificate: undefined, cached: false };
         MseMediaSource.drmElements.set(this.video, state);
       }
       const elementState = state;
@@ -2194,10 +2217,12 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
     this.video.removeEventListener('encrypted', this.handleEncrypted);
-    for (const session of this.keySessions.keys()) this.retireKeySession(session);
+    for (const session of this.keySessions.keys()) this.releaseKeySession(session);
     this.mediaKeys = null;
-    // Leave the attachment available for a compatible reconnect. Temporary
-    // sessions are closed; no old license work survives the adapter.
+    // Leave the attachment available for a compatible reconnect. Without a
+    // session cache, temporary sessions are closed and no old license work
+    // survives the adapter. With one, usable sessions stay in the cache and
+    // only in-flight license work is cancelled.
     this.reset();
     if (this.objectUrl) {
       URL.revokeObjectURL(this.objectUrl);
@@ -2223,42 +2248,48 @@ export class MseMediaSource implements MediaSourceLike {
   private async setupMediaKeys(drm: DrmConfig, state: DrmElementState): Promise<void> {
     if (this.destroyed) return;
     const keySystem = drm.keySystem ?? 'com.widevine.alpha';
+    const cache = drm.sessionCache ?? null;
     try {
       await state.ready;
       if (this.destroyed) return;
-      // An arbitrary MediaKeys object does not expose its key system. Only
-      // reuse an attachment whose configuration we established ourselves.
-      if (state.keys && this.video.mediaKeys === state.keys
-          && state.keySystem === keySystem
-          && equalDrmBytes(state.certificate, drm.serverCertificate)) {
-        this.mediaKeys = state.keys;
-        return;
-      }
-      const access = await navigator.requestMediaKeySystemAccess(keySystem, [{
-        initDataTypes: ['cenc'],
-        videoCapabilities: [
-          { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
-          { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
-        ],
-        audioCapabilities: [
-          { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
-        ],
-      }]);
-      if (this.destroyed) return;
-      const keys = await access.createMediaKeys();
-      if (this.destroyed) return;
-      if (drm.serverCertificate) {
-        await keys.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+      let keys: MediaKeys;
+      if (cache) {
+        // Cached keys carry retained sessions; they are per partition and
+        // shared only through the cache, never through the element state.
+        keys = await cache.mediaKeys(drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate), async () => {
+          const access = await navigator.requestMediaKeySystemAccess(keySystem, DRM_ACCESS_CONFIG);
+          const created = await access.createMediaKeys();
+          if (drm.serverCertificate) await created.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+          return created;
+        });
         if (this.destroyed) return;
+      } else {
+        // An arbitrary MediaKeys object does not expose its key system. Only
+        // reuse an attachment whose configuration we established ourselves.
+        if (state.keys && !state.cached && this.video.mediaKeys === state.keys
+            && state.keySystem === keySystem
+            && equalDrmBytes(state.certificate, drm.serverCertificate)) {
+          this.mediaKeys = state.keys;
+          return;
+        }
+        const access = await navigator.requestMediaKeySystemAccess(keySystem, DRM_ACCESS_CONFIG);
+        if (this.destroyed) return;
+        keys = await access.createMediaKeys();
+        if (this.destroyed) return;
+        if (drm.serverCertificate) {
+          await keys.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+          if (this.destroyed) return;
+        }
       }
       const attach = state.ready.then(async () => {
         if (this.destroyed) return;
-        await this.video.setMediaKeys(keys);
+        if (!cache || this.video.mediaKeys !== keys) await this.video.setMediaKeys(keys);
         // setMediaKeys cannot be cancelled. Record the completed attachment for
         // the next queued owner even if this adapter was destroyed meanwhile.
         state.keys = keys;
         state.keySystem = keySystem;
         state.certificate = drm.serverCertificate;
+        state.cached = cache !== null;
         if (!this.destroyed) this.mediaKeys = keys;
       });
       // A failed attachment must not poison the next owner's queue. Permission
@@ -2285,13 +2316,22 @@ export class MseMediaSource implements MediaSourceLike {
       for (const state of this.keySessions.values()) {
         if (state.initDataType === event.initDataType && equalDrmBytes(state.initData, initData)) return;
       }
+      const cache = this.drmConfig.sessionCache;
+      const partition = cache ? drmPartition(this.drmConfig.keySystem ?? 'com.widevine.alpha',
+        this.drmConfig.licenseUrl, this.drmConfig.serverCertificate) : '';
+      // Partition equality implies these keys: the cache holds one MediaKeys per partition.
+      const reuse = cache ? this.retainKeySession((revoke) =>
+        cache.acquire(partition, event.initDataType, initData, revoke)) : null;
+      if (reuse) {
+        // Already licensed and usable: no generateRequest, no license POST.
+        this.holdKeySession(reuse.entry.session, event.initDataType, initData, reuse);
+        return;
+      }
       session = this.mediaKeys.createSession('temporary');
-      this.keySessions.set(session, {
-        initDataType: event.initDataType, initData, abort: new AbortController(),
-      });
-      session.addEventListener('message', this.handleKeyMessage);
-      const ownedSession = session;
-      void session.closed.then(() => this.retireKeySession(ownedSession, false));
+      const created = session;
+      const retained = cache ? this.retainKeySession((revoke) =>
+        cache.track(partition, created, event.initDataType, initData, revoke)) : null;
+      this.holdKeySession(session, event.initDataType, initData, retained);
       await session.generateRequest(event.initDataType, initData);
     } catch (err) {
       if (session && !this.keySessions.has(session)) return;
@@ -2329,15 +2369,60 @@ export class MseMediaSource implements MediaSourceLike {
     }
   };
 
+  private holdKeySession(session: MediaKeySession, initDataType: string, initData: Uint8Array,
+      cached: DrmSessionState['cached']): void {
+    const state: DrmSessionState = { initDataType, initData, abort: new AbortController(), cached };
+    this.keySessions.set(session, state);
+    session.addEventListener('message', this.handleKeyMessage);
+    void session.closed.then(() => {
+      if (this.keySessions.get(session) === state) this.retireKeySession(session, false);
+    });
+  }
+
+  /**
+   * Bind a cache operation to a revocation token for this adapter. Revocation
+   * (another adapter acquired the session) forgets it without closing it.
+   */
+  private retainKeySession(
+      bind: (revoke: () => void) => DrmCachedSession | null): { entry: DrmCachedSession; revoke: () => void } | null {
+    let entry: DrmCachedSession | null = null;
+    const revoke = (): void => {
+      const session = entry?.session;
+      const state = session && this.keySessions.get(session);
+      if (!session || !state || state.cached?.revoke !== revoke) return;
+      this.keySessions.delete(session);
+      session.removeEventListener('message', this.handleKeyMessage);
+      state.abort.abort();
+    };
+    entry = bind(revoke);
+    return entry ? { entry, revoke } : null;
+  }
+
+  /** Failure or CDM close: the session is gone for every owner. */
   private retireKeySession(session: MediaKeySession, close = true): void {
     const state = this.keySessions.get(session);
     if (!state) return;
     this.keySessions.delete(session);
     session.removeEventListener('message', this.handleKeyMessage);
     state.abort.abort();
+    if (state.cached) this.drmConfig?.sessionCache?.drop(state.cached.entry, false);
     if (close) {
       try { void session.close().catch(() => {}); } catch { /* Already closed by the CDM. */ }
     }
+  }
+
+  /** Adapter teardown: hand a retained session back to its cache, else retire it. */
+  private releaseKeySession(session: MediaKeySession): void {
+    const state = this.keySessions.get(session);
+    if (!state?.cached) {
+      this.retireKeySession(session);
+      return;
+    }
+    this.keySessions.delete(session);
+    session.removeEventListener('message', this.handleKeyMessage);
+    // Cancels an in-flight license or renewal; the cache closes a session that never became usable.
+    state.abort.abort();
+    this.drmConfig?.sessionCache?.release(state.cached.entry, state.cached.revoke);
   }
 
   private reportDrmError(stage: string, err: unknown): void {
