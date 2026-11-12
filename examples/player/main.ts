@@ -239,6 +239,14 @@ let mediaSourceRef: MseMediaSource | null = null;
 // One DRM session cache for the page, so a restart or switch to a broadcast
 // whose keys are already licensed reuses that license.
 const drmSessionCache = new DrmSessionCache();
+const catTokenParam = ((): Uint8Array | null => {
+    const raw = params.get('cat');
+    if (!raw) return null;
+    try {
+        const bytes = Uint8Array.from(atob(raw.replace(/^base64:/, '').replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+        return Uint8Array.from([0x03, 0x10, ...bytes]);
+    } catch { return null; }
+})();
 /**
  * Two-source latch for the joined startup summary (diagnostics only).
  *
@@ -1276,6 +1284,9 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         url: relayUrl,
         namespace: namespaceArg,
         ...(authority ? { authority } : {}),
+        // ?cat=<base64 CWT, optionally prefixed "base64:">: a CAT4MOQ token, sent
+        // as AUTHORIZATION_TOKEN (USE_VALUE, token type 16) on setup and requests.
+        ...(catTokenParam ? { authTokens: [catTokenParam] } : {}),
         ...(warmStart ? { warmStartCurrentGroup: true } : {}),
         ...(catalogBootstrap ? { catalogBootstrap } : {}),
         // ?log=debug|info|warn|error — surface player-internal logs on the console.
