@@ -82,3 +82,11 @@ export {
     findLocationForPts,
     mergeMediaTimeline,
 } from './timeline.js';
+
+// ─── MSF URLs (draft-ietf-moq-msf-01 §11.1) ──────────────────────────
+
+export { parseMsfUrl, parseMsfFragment, formatMsfUrl, formatMsfFragment } from './msf-url.js';
+export type {
+    MsfUrl, MsfFragment, MsfUrlInit, MsfFragmentInit, MsfUrlParameter,
+    MsfTimeRange, MsfLocation, MsfLocationRange,
+} from './msf-url.js';
