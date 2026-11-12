@@ -239,6 +239,33 @@ let mediaSourceRef: MseMediaSource | null = null;
 // One DRM session cache for the page, so a restart or switch to a broadcast
 // whose keys are already licensed reuses that license.
 const drmSessionCache = new DrmSessionCache();
+
+// ?liveedge=<ms>: hold the MSE playhead this far behind the buffered end. The
+// player never catches up on the MSE path, so a slow start (an EME license
+// round trip, a late first append) otherwise stays as latency. A lag of more
+// than a second is jumped; a smaller one is closed at 5% faster playback.
+const liveEdgeMs = Number(params.get('liveedge') ?? '');
+let liveEdgeTimer: ReturnType<typeof setInterval> | undefined;
+function startLiveEdgeController(): void {
+    if (liveEdgeTimer !== undefined || !Number.isFinite(liveEdgeMs) || liveEdgeMs <= 0) return;
+    const target = liveEdgeMs / 1000;
+    const state = { jumps: 0, rate: 1 };
+    (window as any).__liveEdge = state;
+    liveEdgeTimer = setInterval(() => {
+        const v = document.querySelector('video');
+        if (!v || v.paused || v.seeking || v.readyState < 3 || !v.buffered.length) return;
+        const end = v.buffered.end(v.buffered.length - 1);
+        const ahead = end - v.currentTime;
+        if (ahead > target + 1.0) {
+            v.currentTime = end - target;
+            state.jumps++;
+            return;
+        }
+        const rate = ahead > target + 0.1 ? 1.05 : ahead < target - 0.1 ? 0.97 : 1.0;
+        if (v.playbackRate !== rate) v.playbackRate = rate;
+        state.rate = rate;
+    }, 250);
+}
 const catTokenParam = ((): Uint8Array | null => {
     const raw = params.get('cat');
     if (!raw) return null;
@@ -1508,6 +1535,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
 
     // Expose player on window for console inspection (dev only)
     (window as any).__player = player;
+    startLiveEdgeController();
 
     const output = outputSignal ? waitForOutput(p, outputSignal,
         () => selectionMenus(catalogSelection, p.selection).hasVideo,
