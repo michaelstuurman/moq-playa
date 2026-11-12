@@ -131,6 +131,7 @@ export function fixture(configure?: (p: FakePlayer, index: number) => void) {
     namespaceArg: 'live',
     msfLink: undefined,
     msfRefusal: undefined,
+    startLiveEdgeController: () => {},
     authority: undefined,
     warmStart: false,
     catalogFromUrl: undefined,

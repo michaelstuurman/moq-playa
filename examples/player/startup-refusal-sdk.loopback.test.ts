@@ -105,6 +105,7 @@ function fixture() {
     namespaceArg: 'live',
     msfLink: undefined,
     msfRefusal: undefined,
+    startLiveEdgeController: () => {},
     authority: undefined,
     warmStart: false,
     catalogFromUrl: undefined,
