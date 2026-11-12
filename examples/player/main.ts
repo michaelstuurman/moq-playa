@@ -22,7 +22,7 @@ import { MoqtConnection } from '@openmoq/webtransport';
 import { QlogTrace, varint } from '@openmoq/transport';
 import { CATALOG_TRACK_NAME } from '@openmoq/msf';
 import { log } from '../shared/log.js';
-import { namespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
+import { namespaceArg as queryNamespaceArg, authority, warmStart, certHash, draftVersion, catalogBootstrap } from '../shared/cert.js';
 import { resolveRelayEndpoint, discoveredRelayUrl } from '../shared/relay-endpoint.js';
 import {
     AudioAlignedClock,
@@ -42,6 +42,7 @@ import type { CatalogTrack } from '@openmoq/msf';
 import { renderTrackMenus, playbackOwnerIsCurrent, selectionMenus, updateSelectionLink,
     type PresentationChoice } from './selection-controls.js';
 import { TeardownBarrier, ViewRetuner, parseVideoAltGroup, waitForOutput } from './view-selection.js';
+import { readMsfLink, type PlayerMsfLink } from './msf-link.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -65,6 +66,18 @@ function readCatalogParam(): { tracks: any[] } | undefined {
 /** Parsed catalog from URL param (if any). */
 const catalogFromUrl = readCatalogParam();
 
+// MSF URL in the page fragment (draft-ietf-moq-msf-01 §11.1; see msf-link.ts).
+// The fragment may hold a token: it is never logged. A malformed or
+// unsupported MSF URL refuses playback rather than falling back to ?ns=.
+let msfLink: PlayerMsfLink | undefined;
+let msfRefusal: string | undefined;
+try { msfLink = readMsfLink(window.location.hash, window.location.search); }
+catch (error) { msfRefusal = (error as Error).message; }
+// A fragment-only change does not load the page again by itself.
+window.addEventListener('hashchange', () => window.location.reload());
+
+const namespaceArg: string | readonly string[] = msfLink?.namespace ?? queryNamespaceArg;
+
 {
     const settingsBtn = document.getElementById('settings-btn')!;
     const backdrop = document.getElementById('settings-backdrop')!;
@@ -73,6 +86,7 @@ const catalogFromUrl = readCatalogParam();
     const sAuthority = document.getElementById('s-authority') as HTMLInputElement;
     const sWarmStart = document.getElementById('s-warm-start') as HTMLInputElement;
     const sHash = document.getElementById('s-hash') as HTMLInputElement;
+    const sAuthProfile = document.getElementById('s-auth-profile') as HTMLSelectElement;
     const sVersion = document.getElementById('s-version') as HTMLSelectElement;
     const sCatalog = document.getElementById('s-catalog') as HTMLTextAreaElement;
     const sLate = document.getElementById('s-late') as HTMLInputElement;
@@ -94,7 +108,7 @@ const catalogFromUrl = readCatalogParam();
     }
 
     function prefillUrlField() {
-        sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? '';
+        sUrl.value = msfLink?.relayUrl ?? params.get('url') ?? discoveredRelayUrl() ?? '';
         if (sUrl.value || modalDiscovery) return;
         modalDiscovery = new AbortController();
         void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
@@ -106,7 +120,11 @@ const catalogFromUrl = readCatalogParam();
     // Populate from current URL params
     function populateFields() {
         prefillUrlField();
-        sNs.value = params.get('ns') ?? 'live';
+        sNs.value = msfLink ? msfLink.namespace.join('/') : params.get('ns') ?? 'live';
+        // Shown, not editable: the MSF URL in the page fragment sets these.
+        sNs.disabled = msfLink !== undefined;
+        sUrl.disabled = msfLink?.relayUrl !== undefined;
+        sAuthProfile.value = params.get('authProfile') === 'moqx-compat' ? 'moqx-compat' : 'cat4moq';
         sAuthority.value = params.get('authority') ?? '';
         sWarmStart.checked = params.get('warmStart') === '1';
         sHash.value = params.get('hash') ?? '';
@@ -152,8 +170,9 @@ const catalogFromUrl = readCatalogParam();
         const gap = sGap.value.trim();
         const catalogJson = sCatalog.value.trim();
 
-        if (url) newParams.set('url', url);
-        if (ns && ns !== 'live') newParams.set('ns', ns);
+        if (url && !sUrl.disabled) newParams.set('url', url);
+        if (ns && ns !== 'live' && !sNs.disabled) newParams.set('ns', ns);
+        if (sAuthProfile.value !== 'cat4moq') newParams.set('authProfile', sAuthProfile.value);
         if (authorityValue) newParams.set('authority', authorityValue);
         if (sWarmStart.checked) newParams.set('warmStart', '1');
         if (hash) newParams.set('hash', hash);
@@ -174,7 +193,14 @@ const catalogFromUrl = readCatalogParam();
         }
 
         const qs = newParams.toString();
-        window.location.href = window.location.pathname + (qs ? '?' + qs : '');
+        const target = window.location.pathname + (qs ? '?' + qs : '');
+        if (window.location.hash) {
+            // Keep the MSF URL. With a fragment, assigning an unchanged URL would not load the page again.
+            history.pushState(null, '', target + window.location.hash);
+            window.location.reload();
+        } else {
+            window.location.href = target;
+        }
     });
 }
 
@@ -1097,7 +1123,7 @@ async function prefetchCatalogViaFetch(relayUrl: string, signal: AbortSignal): P
                 ...(authority ? { authority } : {}),
             });
             signal.throwIfAborted();
-            const reqId = await connection.fetch(nsBytes, enc.encode(CATALOG_TRACK_NAME), {
+            const reqId = await connection.fetch(nsBytes, enc.encode(msfLink?.catalogTrackName ?? CATALOG_TRACK_NAME), {
                 startGroup: varint(0n), startObject: varint(0n),
                 endGroup: varint(0n), endObject: varint(0n),
             });
@@ -1161,6 +1187,7 @@ async function startPlayback(outputSignal?: AbortSignal): Promise<void> {
 async function startPlaybackAttempt(epoch: number, transportAbort: AbortController, outputSignal?: AbortSignal): Promise<void> {
     const legacyAltGroup = selectedPresentation === undefined ? parseVideoAltGroup(params.get('altGroup')) : undefined;
     const selection = selectedPresentation ?? (legacyAltGroup !== undefined ? { videoAltGroup: legacyAltGroup } : undefined);
+    if (msfRefusal !== undefined) throw new PlaybackStartFailure(msfRefusal, false);
     // Stale-attempt token: a reconnect attempt that times out (withTimeout) keeps
     // running underneath — the loop's cleanup stopPlayback() bumps playEpoch, and
     // this attempt must then bail without mutating player/UI state.
@@ -1177,7 +1204,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     let relayUrl: string;
     try {
         log('Discovering relay endpoint...');
-        relayUrl = await resolveRelayEndpoint({ signal: discovery.signal });
+        relayUrl = msfLink?.relayUrl ?? await resolveRelayEndpoint({ signal: discovery.signal });
     } catch (err) {
         if (epoch !== playEpoch) return;         // superseded by Stop
         log(`Endpoint discovery failed: ${(err as Error).message}`);
@@ -1193,6 +1220,10 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
 
     log(`Relay: ${relayUrl}`);
     log(`Namespace: ${Array.isArray(namespaceArg) ? `[${namespaceArg.map(f => `"${f}"`).join(', ')}]` : namespaceArg}`);
+    if (msfLink) {
+        log(`MSF URL: track "${msfLink.catalogTrackName}"${msfLink.authorization ? ', c4m token' : ''}${msfLink.licenseUrl ? ', license URL' : ''}`);
+        for (const note of msfLink.notes) log(`MSF URL: ${note}`);
+    }
     if (authority) log(`Authority: ${authority}`);
     if (warmStart) log('Warm start: joining FETCH for the current group (live LOC)');
     if (catalogFromUrl) log(`Catalog: injected (${catalogFromUrl.tracks.length} tracks)`);
@@ -1271,6 +1302,8 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     const p = new MoqtPlayer({
         url: relayUrl,
         namespace: namespaceArg,
+        ...(msfLink ? { catalogTrackName: msfLink.catalogTrackName } : {}),
+        ...(msfLink?.authorization ? { authorization: msfLink.authorization } : {}),
         ...(authority ? { authority } : {}),
         ...(warmStart ? { warmStartCurrentGroup: true } : {}),
         ...(catalogBootstrap ? { catalogBootstrap } : {}),
@@ -1302,7 +1335,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
-            const licenseUrl = params.get('license');
+            const licenseUrl = msfLink?.licenseUrl ?? params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
