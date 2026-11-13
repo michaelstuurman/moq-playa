@@ -277,11 +277,25 @@ function startLiveEdgeController(): void {
     const target = liveEdgeMs / 1000;
     const state = { jumps: 0, rate: 1 };
     (window as any).__liveEdge = state;
+    // A readout in the corner of the picture: the buffer ahead of the playhead,
+    // the encode-to-presentation delay when the stream carries capture times,
+    // the playback rate and the number of jumps.
+    const readout = document.createElement('div');
+    readout.style.cssText = 'position:absolute;top:8px;left:8px;z-index:5;padding:3px 7px;border-radius:4px;'
+        + 'background:rgba(0,0,0,.6);color:#fff;font:12px/1.4 ui-monospace,Menlo,monospace;pointer-events:none';
+    playerWrap.appendChild(readout);
     liveEdgeTimer = setInterval(() => {
         const v = document.querySelector('video');
-        if (!v || v.paused || v.seeking || v.readyState < 3 || !v.buffered.length) return;
+        if (!v || !v.buffered.length) { readout.textContent = 'buffer --'; return; }
         const end = v.buffered.end(v.buffered.length - 1);
         const ahead = end - v.currentTime;
+        const stats: PlayerStats | undefined = player ? ((player as any)._stats?.snapshot() ?? player.stats) : undefined;
+        const shown = (stats as any)?.videoPresentationObservation?.encodeToPresentationMs;
+        readout.textContent = `buffer ${Math.round(ahead * 1000)} ms`
+            + (typeof shown === 'number' ? ` \u00b7 delay ${Math.round(shown)} ms` : '')
+            + ` \u00b7 ${v.playbackRate.toFixed(2)}x \u00b7 jumps ${state.jumps}`
+            + (stats ? ` \u00b7 stalls ${stats.stallCount}` : '');
+        if (v.paused || v.seeking || v.readyState < 3) return;
         if (ahead > target + 1.0) {
             v.currentTime = end - target;
             state.jumps++;
