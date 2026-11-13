@@ -281,17 +281,34 @@ interface DrmSessionState {
   cached: { entry: DrmCachedSession; revoke: () => void } | null;
 }
 
-/** Fixed EME access request; reuse across adapters assumes it never varies. */
-const DRM_ACCESS_CONFIG: MediaKeySystemConfiguration[] = [{
-  initDataTypes: ['cenc'],
-  videoCapabilities: [
-    { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
-    { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
-  ],
-  audioCapabilities: [
-    { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
-  ],
-}];
+/**
+ * The EME access request per key system. Reuse across adapters assumes it
+ * never varies for a key system (the cache partition includes the key system).
+ * FairPlay (`com.apple.fps`, Safari) signals keys with `sinf` init data, not
+ * `cenc` pssh boxes, and Safari matches plain container types.
+ */
+export function drmAccessConfigurations(keySystem: string): MediaKeySystemConfiguration[] {
+  if (keySystem === 'com.apple.fps' || keySystem.startsWith('com.apple.fps.')) {
+    return [{
+      initDataTypes: ['sinf'],
+      videoCapabilities: [{ contentType: 'video/mp4', robustness: '' }],
+      audioCapabilities: [{ contentType: 'audio/mp4', robustness: '' }],
+      distinctiveIdentifier: 'not-allowed',
+      persistentState: 'not-allowed',
+      sessionTypes: ['temporary'],
+    }];
+  }
+  return [{
+    initDataTypes: ['cenc'],
+    videoCapabilities: [
+      { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
+      { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
+    ],
+    audioCapabilities: [
+      { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
+    ],
+  }];
+}
 
 function equalDrmBytes(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
   if (a === b) return true;
@@ -2286,7 +2303,7 @@ export class MseMediaSource implements MediaSourceLike {
         // Cached keys carry retained sessions; they are per partition and
         // shared only through the cache, never through the element state.
         keys = await cache.mediaKeys(drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate), async () => {
-          const access = await navigator.requestMediaKeySystemAccess(keySystem, DRM_ACCESS_CONFIG);
+          const access = await navigator.requestMediaKeySystemAccess(keySystem, drmAccessConfigurations(keySystem));
           const created = await access.createMediaKeys();
           if (drm.serverCertificate) await created.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
           return created;
@@ -2301,7 +2318,7 @@ export class MseMediaSource implements MediaSourceLike {
           this.mediaKeys = state.keys;
           return;
         }
-        const access = await navigator.requestMediaKeySystemAccess(keySystem, DRM_ACCESS_CONFIG);
+        const access = await navigator.requestMediaKeySystemAccess(keySystem, drmAccessConfigurations(keySystem));
         if (this.destroyed) return;
         keys = await access.createMediaKeys();
         if (this.destroyed) return;

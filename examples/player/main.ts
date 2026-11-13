@@ -32,6 +32,8 @@ import {
     CanvasRenderer,
     WebAudioOutput,
     MseMediaSource,
+    drmAccessConfigurations,
+    type DrmConfig,
     type MseStartupReport,
     type CmafStartupGeometry,
     CmafAssembler,
@@ -1346,6 +1348,17 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     // build. Production is always `shared`.
     const epochMode = pickParam('epoch', ['shared', 'legacy'] as const, 'shared');
     const mseDebug = params.get('msedebug') === '1';
+    // DRM: `license` (Widevine), and for Safari `fairplay` + `fpscert`, from
+    // the MSF fragment or else the query. FairPlay fetches the certificate and
+    // probes the key system, once per page; without it the choice stays
+    // synchronous, so startup is unchanged.
+    const widevineUrl = msfLink?.licenseUrl ?? params.get('license');
+    const widevineDrm: DrmConfig | undefined = widevineUrl ? { licenseUrl: widevineUrl } : undefined;
+    const fairplayUrl = msfLink?.fairplayUrl ?? params.get('fairplay');
+    const fpsCertUrl = msfLink?.fpsCertUrl ?? params.get('fpscert');
+    const drmConfig = fairplayUrl && fpsCertUrl
+        ? await (drmChoice ??= chooseFairplay(fairplayUrl, fpsCertUrl, widevineDrm))
+        : widevineDrm;
     startupSummaryEnabled = mseDebug;
 
     // FETCH-catalog mode: pre-fetch + reuse adapter so the player skips
@@ -1404,12 +1417,11 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
-            const licenseUrl = msfLink?.licenseUrl ?? params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
-                ...(licenseUrl ? { drmConfig: { licenseUrl, sessionCache: drmSessionCache } } : {}),
+                ...(drmConfig ? { drmConfig: { ...drmConfig, sessionCache: drmSessionCache } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
@@ -1686,4 +1698,36 @@ function buildTrackSelector(p: MoqtPlayer | null): void {
             });
         },
     }, !p || selectionBusy() || p.state === 'error' || p.state === 'ended');
+}
+
+let drmChoice: Promise<DrmConfig | undefined> | undefined;
+
+/**
+ * FairPlay (license URL: SPC in, CKC out) when the browser has it and the
+ * certificate loads; otherwise `fallback` (Widevine).
+ */
+async function chooseFairplay(
+    licenseUrl: string, certificateUrl: string, fallback: DrmConfig | undefined,
+): Promise<DrmConfig | undefined> {
+    if (!await hasKeySystem('com.apple.fps')) return fallback;
+    try {
+        const response = await fetch(certificateUrl);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const serverCertificate = new Uint8Array(await response.arrayBuffer());
+        log('[DRM] FairPlay');
+        return { licenseUrl, keySystem: 'com.apple.fps', serverCertificate };
+    } catch (err) {
+        log(`[DRM] FairPlay certificate unavailable (${String(err)})`);
+        return fallback;
+    }
+}
+
+async function hasKeySystem(keySystem: string): Promise<boolean> {
+    if (!navigator.requestMediaKeySystemAccess) return false;
+    try {
+        await navigator.requestMediaKeySystemAccess(keySystem, drmAccessConfigurations(keySystem));
+        return true;
+    } catch {
+        return false;
+    }
 }

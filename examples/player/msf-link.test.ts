@@ -43,6 +43,18 @@ describe('player MSF link', () => {
     expect(readMsfLink(hash, '')).toEqual({ namespace: ['live'], catalogTrackName: 'catalog', licenseUrl, notes: [] });
   });
 
+  it('reads the FairPlay license and certificate parameters', () => {
+    const fairplayUrl = 'https://drm.test/fairplay/license?token=a';
+    const fpsCertUrl = 'https://drm.test/fairplay/certificate';
+    const hash = `#${formatMsfFragment({ namespace: ['live'], trackName: 'catalog', parameters: [
+      { name: 'fairplay', value: encodeURIComponent(fairplayUrl) },
+      { name: 'fpscert', value: encodeURIComponent(fpsCertUrl) },
+    ] })}`;
+    expect(readMsfLink(hash, '')).toEqual({ namespace: ['live'], catalogTrackName: 'catalog', fairplayUrl, fpsCertUrl, notes: [] });
+    expect(() => readMsfLink(hash, '?fairplay=x')).toThrow('?fairplay=');
+    expect(() => readMsfLink('#msf:live--catalog&fpscert=nope', '')).toThrow(/^MSF URL fpscert parameter must be/);
+  });
+
   it.each(['license=', 'license=%ff', 'license=drm.test%2Flicense', 'license=javascript%3Aalert(1)', 'license=https%3A%2F%2Fdrm.test%2F%23x',
     'license=https%3A%2F%2Fa.test%2F&license=https%3A%2F%2Fb.test%2F'])('rejects %j without echoing it', parameters => {
     let message = '';
