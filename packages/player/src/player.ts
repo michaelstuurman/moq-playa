@@ -90,9 +90,13 @@ import { MediaStageObservers } from './media-stage-observers.js';
 import type { MediaDiagnosticRuntime, MediaDiagnosticsFactory, MediaStageObserver, MediaDiscardReason } from './media-diagnostic-types.js';
 import type { ObjectRoutingContext, ObjectRoutingDiscardReason, ObjectDeliveryAdmission, ObjectDeliveryOptions } from './subscription-manager.js';
 import { SubscriptionManager, type TrackPackaging } from './subscription-manager.js';
+import { extractLargestLocation } from './player-message.js';
 import { WarmStartHead } from './warm-start-head.js';
 
 interface LivenessRestart {
+  wake?: () => void;
+  announced?: boolean;
+  track: LivenessTrack;
   attempts: number;
   active: boolean;
   cancelled: boolean;
@@ -102,7 +106,7 @@ interface LivenessRestart {
   readonly trackName: string;
   readonly ownsOutput: () => boolean;
   requestId: bigint;
-  refusal: { retryInterval: bigint | null; atMs: number } | null;
+  refusal: { retryInterval: bigint | null; atMs: number; errorCode: bigint } | null;
   failure: string | null;
 }
 
@@ -115,12 +119,13 @@ interface WarmMediaRoute {
 interface WarmMediaOwner {
   readonly connection: MoqtConnection;
   readonly requestId: bigint;
-  readonly subscription: { trackAlias: bigint | null };
+  readonly subscription: { trackAlias: bigint | null; subscriberPriority?: number; mediaType: string; namespace?: readonly string[] };
   registration: (() => boolean) | null;
   head: WarmStartHead<WarmMediaRoute> | null;
   prefixFetch: MediaFetchInfo | null;
   readonly prefixStart?: { readonly group: bigint; readonly object: bigint };
   prefixCancelled?: boolean;
+  prefixStandalone?: boolean;
 }
 
 interface MediaFetchInfo {
@@ -147,6 +152,8 @@ interface LocmafChunkDetails {
 }
 import type { MediaSourceLike, MediaAppendQueueLease, MediaSwitchRecovery, VideoPresentation, AudioOutputLike } from './interfaces.js';
 import { CommandDispatcher, type DispatcherOutputObserver } from './command-dispatcher.js';
+import { LiveCatchUp, type PlaybackRateOutput } from './live-catch-up.js';
+import { LocRateOutput } from './loc-rate-output.js';
 import { StatsAccumulator } from './stats.js';
 import type { PlayerStats, VideoEncodeObservation, VideoPresentationObservation } from './stats.js';
 import type { CmafAssemblerLike, CmafSourceReceipt } from './interfaces.js';
@@ -177,8 +184,22 @@ import { isDraft22, isRequestStreamDraft } from '@openmoq/transport';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
+const LATE_AUDIO_WINDOW_US = 300_000;
+const LATE_AUDIO_HEADROOM_US = 500_000;
+const LATE_AUDIO_SETTLE_US = 2_000_000;
+
+/** Required duration of excess received media before a live jump. */
+const LIVE_JUMP_SUSTAIN_US = 1_000_000;
+/** Media left ahead on the advanced timeline for delivery jitter. */
+const LIVE_JUMP_CUSHION_US = 500_000;
+/** Minimum time between live latency jumps. */
+const LIVE_JUMP_COOLDOWN_US = 5_000_000;
+
 /** Object limit for a make-before-break video's retained input. */
 const SWITCH_STAGING_MAX_OBJECTS = 100;
+
+/** Subscriber priority a SUBSCRIBE without the parameter is treated as (the transport codecs' default). */
+const DEFAULT_SUBSCRIBER_PRIORITY = 128;
 
 /** draft-22 FILL_PARAMETERS for joining the current group: a LOCATION_FILTER
  *  of [1] (the current group: Largest.Group + 1 - 1), the
@@ -192,7 +213,8 @@ const SWITCH_STAGING_TIMEOUT_MS = 3_000;
 const HISTORICAL_SWITCH_RESERVE_MS = 100;
 
 /** One current route's receiving admission; no payload or group history. */
-interface ReceivingVideoOwner {
+interface ReceivingMediaOwner {
+  readonly mediaType: 'video' | 'audio';
   readonly token: object;
   readonly alias: bigint;
   readonly trackName: string;
@@ -838,6 +860,15 @@ export class MoqtPlayer {
     onRecovery: new HookChain<RecoveryAction>(),
   };
 
+  private locRateOutput: LocRateOutput | null = null;
+  private liveCatchUp: LiveCatchUp | null = null;
+  private catchUpOwner: object | null = null;
+  private catchUpStopped: PlayerEventMap['catch_up_changed'] | null = null;
+  private livePlaybackOwner: { current: () => boolean; output: PlaybackRateOutput | null; floorUs: number; targetUs: number | undefined; newest: Map<'video' | 'audio', bigint>; since: number | null } | null = null;
+  private lastLiveJumpUs = -Infinity;
+  private readonly lateAudioAsksUs: number[] = [];
+  private lateAudioDebtUs = 0;
+  private readonly liveAudioObjects = new WeakSet<object>();
   private connection: MoqtConnection | null = null;
   private _adapterOwned = true;
   private qualityController: QualityController | null = null;
@@ -1309,6 +1340,104 @@ export class MoqtPlayer {
    */
   private readonly announcedNamespaces = new Map<bigint, Uint8Array[]>();
 
+  private publisherCatalogWait: { conn: MoqtConnection; waiting: boolean; retryInterval: bigint; atMs: number; timer: ReturnType<typeof setTimeout> } | null = null;
+
+  private async waitForPublisherCatalog(conn: MoqtConnection, reason: string, retryInterval: bigint): Promise<void> {
+    if (!this.mediaRecoveryOwnsConnection(conn) || this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived) return;
+    const fatal = () => this.failCatalogPlayback(createPlayerError(
+      'fatal', 'catalog', PlayerErrorCode.SUBSCRIPTION_REFUSED, `Catalog subscription refused: ${reason} (code=0x${conn.draftVersion === 14 ? '4' : '10'})`));
+    // The refusal starts the bound, even if the local namespace send is blocked.
+    if (!this.publisherCatalogWait || this.publisherCatalogWait.conn !== conn) {
+      const wait = { conn, waiting: false, retryInterval, atMs: performance.now(), timer: setTimeout(() => {
+        if (this.publisherCatalogWait !== wait) return;
+        this.publisherCatalogWait = null;
+        if (wait.retryInterval === 0n && !this._destroyed && !this.isTerminalState() && this.mediaRecoveryOwnsConnection(conn)
+            && !this.catalogSlots.catalogReceived) fatal();
+      }, Math.min(this.config.publisherWaitMs!, 0x7fffffff)) };
+      this.publisherCatalogWait = wait;
+    }
+    this.publisherCatalogWait.retryInterval = retryInterval;
+    this.publisherCatalogWait.atMs = performance.now();
+    if (retryInterval > 0n) this.scheduleCatalogSubscribeRetry(conn, retryInterval);
+    const wait = this.publisherCatalogWait, watch = this.publisherWatches.get(conn), id = watch ? await watch.id : null;
+    if (this.publisherCatalogWait !== wait || !this.mediaRecoveryOwnsConnection(conn)
+        || this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived) return;
+    if (id === null || conn.session.getNamespaceSubscription(id)?.isTerminated !== false) {
+      clearTimeout(wait.timer); this.publisherCatalogWait = null;
+      if (retryInterval === 0n) fatal(); else this.scheduleCatalogSubscribeRetry(conn, retryInterval);
+      return;
+    }
+    wait.waiting = true;
+
+  }
+
+  private readonly publisherWatches = new WeakMap<MoqtConnection, {
+    id: Promise<bigint | null>;
+    withdrawn: Map<string, Set<string>>;
+    releasePublish: () => void;
+  }>();
+
+  private watchPublisher(conn: MoqtConnection): void {
+    if (!(this.config.publisherWaitMs! > 0) || this.publisherWatches.has(conn)
+        || conn.session.state !== SessionState.ESTABLISHED || !this.mediaRecoveryOwnsConnection(conn)) return;
+    const rejectPublish: MoqtConnection['onPublish'] = conn.draftVersion === 14 && !conn.onPublish
+      ? pub => { void conn.rejectSubscribe(pub.requestId, 4n, 'Uninterested').catch(() => {}); } : undefined;
+    if (rejectPublish) conn.onPublish = rejectPublish;
+    this.publisherWatches.set(conn, { withdrawn: new Map(),
+      releasePublish: () => { if (conn.onPublish === rejectPublish) delete conn.onPublish; },
+      id: conn.subscribeNamespace(encodeNamespace(this.config.namespace, this.enc), varint(1n)).catch(() => null) });
+  }
+
+  private publisherRecoveryTracks() {
+    const tracks = this.collectLivenessTracks().map(track => ({ ...track,
+      namespace: this.activeSubscriptions.get(track.requestId)!.namespace ?? namespaceFields(this.config.namespace) }));
+    for (const restart of this.livenessRestarts.values()) {
+      if (restart.announced && restart.connection === this.connection && restart.ownsOutput()
+          && !tracks.some(t => t.mediaType === restart.mediaType && t.trackName === restart.trackName
+            && sameNamespaceFields(t.namespace, restart.namespace)))
+        tracks.push({ ...restart.track, requestId: restart.requestId, namespace: [...restart.namespace] });
+    }
+    return tracks;
+  }
+
+  private async publisherAnnouncement(conn: MoqtConnection, requestId: bigint, msg: ControlMessage): Promise<void> {
+    const watch = this.publisherWatches.get(conn);
+    if (!watch) return;
+    const id = await watch.id;
+    if (id === null || !this.mediaRecoveryOwnsConnection(conn)
+        || !conn.session.getNamespaceSubscription(id)?.isActive) return;
+    let fields: string[], withdrawn: boolean;
+    if (msg.type === 'NAMESPACE' || msg.type === 'NAMESPACE_DONE') {
+      if (requestId !== id) return;
+      fields = [...namespaceFields(this.config.namespace), ...msg.trackNamespaceSuffix.map(f => new TextDecoder().decode(f))];
+      withdrawn = msg.type === 'NAMESPACE_DONE';
+    } else if (msg.type === 'PUBLISH_NAMESPACE' || msg.type === 'PUBLISH_NAMESPACE_DONE') {
+      if (conn.draftVersion !== 14 || !msg.trackNamespace) return;
+      fields = msg.trackNamespace.map(f => new TextDecoder().decode(f));
+      withdrawn = msg.type === 'PUBLISH_NAMESPACE_DONE';
+    } else return;
+    const key = JSON.stringify(fields);
+    if (withdrawn) {
+      watch.withdrawn.set(key, new Set(this.publisherRecoveryTracks()
+        .filter(track => sameNamespaceFields(track.namespace, fields)).map(track => track.trackName)));
+      return;
+    }
+    const waiting = this.publisherCatalogWait;
+    if (waiting?.conn === conn && waiting.waiting && !this.catalogSlots.catalogReceived
+        && BigInt(Math.max(0, Math.floor(performance.now() - waiting.atMs))) >= waiting.retryInterval - 1n
+        && sameNamespaceFields(fields, namespaceFields(this.config.namespace))) {
+      waiting.waiting = false;
+      this.cancelCatalogBootstrap();
+      if (this.mediaRecoveryOwnsConnection(conn)) void this.subscribeCatalog(conn).catch(() => {});
+    }
+    const silent = watch.withdrawn.get(key);
+    watch.withdrawn.delete(key); // Consume before dispatch: at most one replacement per announcement.
+    for (const track of this.publisherRecoveryTracks()) {
+      if (silent?.has(track.trackName) && sameNamespaceFields(track.namespace, fields))
+        void this.handleTrackStarvation(track, 0, 0, fields);
+    }
+  }
+
   /** The media source's permission to cross the hole a live restart leaves, held for one switch. */
   private videoSwitchRecovery: { readonly owner: object; readonly handle: MediaSwitchRecovery } | null = null;
 
@@ -1430,6 +1559,7 @@ export class MoqtPlayer {
       mediaType: 'video' | 'audio' | 'mediatimeline' | 'eventtimeline';
       trackAlias: bigint | null;
       namespace?: readonly string[];
+      subscriberPriority?: number;
     }
   >();
 
@@ -1454,7 +1584,7 @@ export class MoqtPlayer {
     releaseReceiving?: () => void;
     whenIdle?: () => Promise<void> | undefined;
   }>();
-  private readonly receivingVideoOwners = new Map<bigint, ReceivingVideoOwner>();
+  private readonly receivingMediaOwners = new Map<bigint, ReceivingMediaOwner>();
 
   /**
    * Restart state keyed by namespace fields, name and media type. A replacement
@@ -1476,8 +1606,23 @@ export class MoqtPlayer {
   private _mediaSubsOk = 0;
   private _mediaSubsFailed = 0;
 
+  /** Only playback-admitted Objects advance the handover watermark. */
+  private readonly deliveredLocations = new WeakMap<object, { group: bigint; object: bigint }>();
+  private readonly deliverySubscriptions = new Map<bigint, object>();
+
   /** One initial retrieval and its completed/abandoned fence per issued owner. */
   private readonly warmMediaOwners = new Map<object, WarmMediaOwner>();
+
+  private recordDeliveredObject(obj: { kind: MoqtObject['kind']; trackAlias: bigint; groupId: bigint; objectId: bigint }): void {
+    if (obj.kind !== 'data') return;
+    const sub = this.deliverySubscriptions.get(BigInt(obj.trackAlias));
+    if (!sub) return;
+    const previous = this.deliveredLocations.get(sub);
+    const location = { group: BigInt(obj.groupId), object: BigInt(obj.objectId) };
+    if (!previous || location.group > previous.group || location.group === previous.group && location.object > previous.object) {
+      this.deliveredLocations.set(sub, location);
+    }
+  }
 
   private warmMediaOwnerCurrent(owner: WarmMediaOwner): boolean {
     if (this._destroyed || this.isTerminalState()
@@ -1505,6 +1650,7 @@ export class MoqtPlayer {
     if (!subscription) return null;
     const owner: WarmMediaOwner = { connection, requestId, subscription, registration: null, head: null, prefixFetch: null,
       ...(prefixStart ? { prefixStart: { ...prefixStart } } : {}) };
+    if (subscription.trackAlias !== null) owner.registration = this.subscriptionManager?.captureRoute(subscription.trackAlias) ?? null;
     this.warmMediaOwners.set(subscription, owner);
     const head = new WarmStartHead<WarmMediaRoute>({
       clock: this.clock,
@@ -1551,21 +1697,23 @@ export class MoqtPlayer {
     owner.prefixFetch = null;
     if (info && this.activeFetches.get(info.requestId) === info) this.quarantineFetchRequest(info.requestId);
     try {
-      const work = owner.connection.draftVersion === 22 ? owner.connection.cancelFill(owner.requestId)
+      const work = owner.connection.draftVersion === 22 && !owner.prefixStandalone ? owner.connection.cancelFill(owner.requestId)
         : info ? owner.connection.fetchCancel(info.requestId) : undefined;
       void work?.catch(() => {});
     } catch { /* A retired prefix cannot revoke the retained live subscription. */ }
   }
 
-  private requestWarmRange(owner: WarmMediaOwner, trackName: string): void {
+  private requestWarmRange(owner: WarmMediaOwner, trackName: string, end?: { group: bigint; object: bigint }): void {
     const start = owner.prefixStart;
+    const mediaType = owner.subscription.mediaType;
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     if (!start || owner.prefixCancelled || !this.warmMediaOwnerCurrent(owner)) return;
     let registered = false;
     const register = (id: bigint): void => {
       if (registered) return;
       if (owner.prefixCancelled || !this.warmMediaOwnerCurrent(owner)) throw new Error('Switch history retired before emission');
       registered = true;
-      this.registerMediaFetch(id, { trackName, mediaType: 'video', subscriptionRequestId: owner.requestId,
+      this.registerMediaFetch(id, { trackName, mediaType, subscriptionRequestId: owner.requestId,
         trackAlias: null, warmStart: true, warmOwner: owner }, owner.connection);
     };
     const failed = (): void => {
@@ -1573,8 +1721,22 @@ export class MoqtPlayer {
       this.cancelWarmRange(owner);
     };
     try {
+      if (isDraft22(owner.connection.draftVersion) && end) {
+        // d22 §§3.2, 9.11: standalone FETCH has an inclusive exact range.
+        // The SDK converts its half-open end to that inclusive wire Location.
+        // Unlike a fill REQUEST_UPDATE, refusal cannot terminate the live
+        // subscription (d22 §9.5.1 UPDATE_FAILED); preserve live fallback.
+        owner.prefixStandalone = true;
+        void owner.connection.fetch((owner.subscription.namespace ?? namespaceFields(this.config.namespace)).map(field => this.enc.encode(field)),
+          this.enc.encode(trackName), { startGroup: start.group, startObject: start.object,
+            endGroup: end.group, endObject: end.object + 1n, groupOrder: 'ascending', onRequestId: register,
+          }).then(id => register(BigInt(id))).catch(failed);
+        return;
+      }
       void owner.connection.joiningFetch({ joiningFetchType: 'absolute', joiningRequestId: owner.requestId,
         joiningStart: start.group, groupOrder: 'ascending', onRequestId: register,
+        ...(owner.subscription.subscriberPriority === undefined ? {}
+          : { subscriberPriority: varint(BigInt(owner.subscription.subscriberPriority)) }),
       }).then(id => register(BigInt(id))).catch(failed);
     } catch { failed(); }
   }
@@ -1603,7 +1765,7 @@ export class MoqtPlayer {
     info.streams.set(streamId, closed);
   }
 
-  private retainCurrentVideoStreams(manager: SubscriptionManager, streamId: bigint, obj: MoqtObject,
+  private retainCurrentMediaStreams(manager: SubscriptionManager, streamId: bigint, obj: MoqtObject,
     sourceConnection: MoqtConnection | undefined): void {
     const source = this.mediaSource;
     const retain = source?.retainReceivingGroup;
@@ -1611,7 +1773,8 @@ export class MoqtPlayer {
     if (!source || !retain || !sourceConnection || sourceConnection !== this.connection) return;
     const inputGeneration = manager.mediaInputGeneration;
     const alias = BigInt(obj.trackAlias);
-    if (manager.getMediaType(alias) !== 'video') return;
+    const mediaType = manager.getMediaType(alias);
+    if (mediaType !== 'video' && mediaType !== 'audio') return;
     const stream = this.subgroupStreams.get(streamId);
     // Capture at actual object receipt, including preparation. A header alone
     // establishes neither a Group's existence nor a later alias owner's data.
@@ -1620,14 +1783,14 @@ export class MoqtPlayer {
       const registration = manager.captureRoute(alias);
       if (registration) stream.receivingRegistration = { manager, isCurrent: registration };
     }
-    const cached = this.receivingVideoOwners.get(alias);
+    const cached = this.receivingMediaOwners.get(alias);
     if (cached?.isCurrent()) {
-      this.retainVideoStream(cached, streamId); // O(1) for every subsequent stream/object.
+      this.retainMediaStream(cached, streamId); // O(1) for every subsequent stream/object.
       return;
     }
-    const sub = [...this.activeSubscriptions.values()].find(s => s.trackAlias === alias && s.mediaType === 'video');
+    const sub = [...this.activeSubscriptions.values()].find(s => s.trackAlias === alias && s.mediaType === mediaType);
     const registration = manager.captureRoute(alias);
-    const selection = this.mseSelection('video');
+    const selection = this.mseSelection(mediaType);
     const key = sub && identityKey(sub.namespace ?? namespaceFields(this.config.namespace), sub.trackName);
     if (!sub || !registration || !selection || selection.key !== key) return;
     const keyed = this.keyedCmafIdentity;
@@ -1635,31 +1798,31 @@ export class MoqtPlayer {
     if (keyed && sourceKey === undefined) return;
     // Prune retired routes only at an ownership transition. The cache contains
     // current registrations, not a history of aliases or observed groups.
-    for (const [oldAlias, owner] of this.receivingVideoOwners) {
-      if (!owner.isCurrent()) this.receivingVideoOwners.delete(oldAlias);
+    for (const [oldAlias, owner] of this.receivingMediaOwners) {
+      if (!owner.isCurrent()) this.receivingMediaOwners.delete(oldAlias);
     }
-    const owner: ReceivingVideoOwner = {
-      token: {}, alias, trackName: sub.trackName, manager, source, connection: sourceConnection, retain,
+    const owner: ReceivingMediaOwner = {
+      token: {}, mediaType, alias, trackName: sub.trackName, manager, source, connection: sourceConnection, retain,
       ...(sourceKey === undefined ? {} : { sourceKey }),
-      isCurrent: () => !this._destroyed && this.receivingVideoOwners.get(alias) === owner
+      isCurrent: () => !this._destroyed && this.receivingMediaOwners.get(alias) === owner
         && this.subscriptionManager === manager && this.mediaSource === source
         && manager.mediaInputGeneration === inputGeneration && this.keyedCmafIdentity === keyed
         && sourceConnection === this.connection
         && registration() && this.mediaRouteBelongsTo(sourceConnection, alias)
-        && this.mseSelection('video')?.selection === selection.selection,
+        && this.mseSelection(mediaType)?.selection === selection.selection,
     };
-    this.receivingVideoOwners.set(alias, owner); // Reserve before capability callbacks.
+    this.receivingMediaOwners.set(alias, owner); // Reserve before capability callbacks.
     // A preparation's SAP can adopt the track, followed immediately by a
     // successor stream. Acquire its ALREADY observed open streams before that
     // successor queues. Scan once per route owner, never once per new stream.
     const observed = [...this.subgroupStreams.keys()];
     for (const id of observed) {
       if (!owner.isCurrent()) break;
-      this.retainVideoStream(owner, id);
+      this.retainMediaStream(owner, id);
     }
   }
 
-  private retainVideoStream(owner: ReceivingVideoOwner, streamId: bigint): void {
+  private retainMediaStream(owner: ReceivingMediaOwner, streamId: bigint): void {
     if (!owner.isCurrent()) return;
     const stream = this.subgroupStreams.get(streamId);
     if (stream?.connection !== owner.connection || stream.trackAlias !== owner.alias
@@ -1672,8 +1835,8 @@ export class MoqtPlayer {
     previous?.();
     if (!owner.isCurrent() || this.subgroupStreams.get(streamId) !== stream) return;
     const release = streamRelease(owner.sourceKey === undefined
-      ? owner.retain.call(owner.source, 'video', owner.trackName, stream.groupId, owner.isCurrent)
-      : owner.retain.call(owner.source, 'video', owner.trackName, stream.groupId, owner.isCurrent, owner.sourceKey));
+      ? owner.retain.call(owner.source, owner.mediaType, owner.trackName, stream.groupId, owner.isCurrent)
+      : owner.retain.call(owner.source, owner.mediaType, owner.trackName, stream.groupId, owner.isCurrent, owner.sourceKey));
     if (!owner.isCurrent() || this.subgroupStreams.get(streamId) !== stream) release();
     else stream.releaseReceiving = release;
   }
@@ -1700,7 +1863,7 @@ export class MoqtPlayer {
     // receipt may establish receiving evidence; FETCH has its own ownership.
     if ('kind' in receiptInput && fetchInfo === undefined && sourceConnection !== undefined
         && this.subgroupStreams.get(streamId)?.connection === sourceConnection) {
-      this.retainCurrentVideoStreams(manager, streamId, obj, sourceConnection);
+      this.retainCurrentMediaStreams(manager, streamId, obj, sourceConnection);
     }
     // Receiving capabilities are external callbacks too. Preserve the input
     // generation boundary before continuing into generic preparation/routing.
@@ -1882,6 +2045,7 @@ export class MoqtPlayer {
     this.pendingMediaTerminals.get(conn)?.get(requestId)?.releaseEnd();
     this.pendingMediaTerminals.get(conn)?.delete(requestId);
     const ownerSubscription = this.activeSubscriptions.get(requestId);
+    if (ownerSubscription?.trackAlias != null && this.deliverySubscriptions.get(ownerSubscription.trackAlias) === ownerSubscription) this.deliverySubscriptions.delete(ownerSubscription.trackAlias);
     const warmOwner = ownerSubscription && this.warmMediaOwners.get(ownerSubscription);
     if (warmOwner?.connection === conn) {
       this.warmMediaOwners.delete(ownerSubscription!);
@@ -1971,6 +2135,17 @@ export class MoqtPlayer {
     const terminals = this.pendingMediaTerminals.get(conn);
     this.pendingMediaTerminals.delete(conn);
     if (terminals) for (const terminal of terminals.values()) terminal.releaseEnd();
+  }
+
+  /**
+   * Subscriber priority for a media subscription. Audio goes ahead of video by
+   * default, clamped at priority 0. This is a scheduling preference. Video keeps
+   * whatever the configured parameters say (or none: the relay's default).
+   */
+  private subscriberPriorityFor(mediaType: string): { subscriberPriority?: ReturnType<typeof varint> } {
+    if (mediaType !== 'audio') return {};
+    const base = this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
+    return { subscriberPriority: varint(BigInt(this.config.audioSubscriberPriority ?? Math.max(0, base - 2))) };
   }
 
   /** Retain normal completion data, not errors or stale live-edge recovery (§9.15 / §10.11 / §9.9). */
@@ -2111,7 +2286,7 @@ export class MoqtPlayer {
           // not failed delivery. A deadline alone cannot reject a valid
           // progressing fetch or replace the MSF-01 bootstrap procedure.
           if (this._destroyed || this.isTerminalState() || this.catalogSlots.catalogReceived
-              || this.catalogSlots.catalogSubscribeRetryTimer !== null
+              || this.catalogSlots.catalogSubscribeRetryTimer !== null || this.publisherCatalogWait !== null
               || this.catalogSlots.catalogBootstrapCoord?.phase === 'empty-wait') return;
           this.emitError(createPlayerError(
             'transient', 'catalog', PlayerErrorCode.CATALOG_WAIT_TIMEOUT,
@@ -2163,7 +2338,7 @@ export class MoqtPlayer {
     // Media-liveness monitor: detects per-track delivery starvation while
     // PLAYING and drives the restart ladder. Complements (does not replace)
     // the gap detector, which only handles gaps BETWEEN arrivals.
-    if (this.config.livenessTimeoutMs! > 0) {
+    if (this.config.livenessTimeoutMs! > 0 || this.config.publisherWaitMs! > 0) {
       this.livenessMonitor = new MediaLivenessMonitor({
         livenessTimeoutMs: this.config.livenessTimeoutMs!,
         resetProbeMs: this.config.livenessResetProbeMs!,
@@ -2670,7 +2845,7 @@ export class MoqtPlayer {
       if (!this.admitVideoSwitchObject(this.pendingVideoSwitch, decoded.bytes.byteLength)) {
         this.discardMediaInput(input, 'track superseded'); return;
       }
-      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
+      this.cmafSwitchStagingBuffer.push({ trackName, ...(sourceKey === undefined ? {} : { sourceKey }), mediaType, groupId, objectId: BigInt(obj.objectId), payload: decoded.bytes, sync: decoded.sync, ...(input ? { input } : {}) });
       this.armVideoSwitchTimeout(this.pendingVideoSwitch);
       if (decoded.sync) {
         this.completePendingVideoSwitch();
@@ -2685,6 +2860,7 @@ export class MoqtPlayer {
       if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
     }
 
+    if (this.cmafAssembler) this.recordDeliveredObject(obj);
     this.pushCmafInput(mediaType, trackName, groupId, decoded.bytes, input, sourceKey, undefined, lagOwner);
   }
 
@@ -3008,6 +3184,7 @@ export class MoqtPlayer {
       this.discardMediaInput(input, 'track superseded'); return;
     }
     const pipeline = mediaType === 'video' ? this.videoPipeline : this.audioPipeline;
+    if (pipeline) this.recordDeliveredObject(frame);
     if (!pipeline) this.discardMediaInput(input, 'not attached');
     else if (samples && frame.kind === 'data') pipeline.pushSampleObject(frame, samples, input, {
       ...(delivery?.backfill ? { backfill: true } : {}), allowIndependentGap: samples[0]?.chunk.type === 'key',
@@ -3460,6 +3637,7 @@ export class MoqtPlayer {
       ...(abrAction ? { abrAction } : {}),
     };
     this.revokeVideoSwitchRecovery();
+    this.stopLiveCatchUp();
     this.pendingVideoSwitch = sw;
     this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
     this.emitQualityEvent('quality_switching', {
@@ -3560,6 +3738,13 @@ export class MoqtPlayer {
       // neither replace it nor add a historical request outside that intent.
       const prefixStart = !explicitFilter && startGroup !== undefined && targetTrack.isLive === true
         ? { group: startGroup, object: 0n } : undefined;
+      const basePriority = this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY;
+      const outgoingPriority = (currentVideoRequestId === null ? undefined
+        : this.activeSubscriptions.get(currentVideoRequestId)?.subscriberPriority) ?? basePriority;
+      const audioPriority = this.config.audioSubscriberPriority ?? Math.max(0, basePriority - 2);
+      const targetPriority = (targetTrack.bitrate ?? 0) < (currentTrack.bitrate ?? 0)
+        ? outgoingPriority - 1 > audioPriority ? outgoingPriority - 1 : outgoingPriority
+        : basePriority;
       const fill = prefixStart !== undefined && isDraft22(switchConn.draftVersion);
       let rangeOwner: WarmMediaOwner | null = null;
       // Drafts 14/16 §9.16.2 require LargestObject for Joining FETCH.
@@ -3570,7 +3755,7 @@ export class MoqtPlayer {
       const subscribeOptions = explicitFilter ? buildSubscribeOptions(this.config) : startGroup !== undefined
         ? { subscriptionFilter: legacyJoin ? { type: 'LargestObject' as const }
           : { type: 'AbsoluteStart' as const, startGroup: varint(startGroup), startObject: varint(0n) },
-          ...(fill ? { fill: { filter: { type: 'AbsoluteStart' as const, startGroup, startObject: 0n }, groupOrder: 'ascending' as const } } : {}) }
+          ...(fill ? { fill: { subscriberPriority: targetPriority, filter: { type: 'AbsoluteStart' as const, startGroup, startObject: 0n }, groupOrder: 'ascending' as const } } : {}) }
         : (buildSubscribeOptions(this.config) ?? defaultMediaSubscriptionFilter(targetTrack.isLive === true));
       const register = (id: bigint): void => {
         if (sw.newRequestId !== null) return;
@@ -3583,7 +3768,7 @@ export class MoqtPlayer {
         sw.phase = 'staging';
         this.armVideoSwitchTimeout(sw, SWITCH_STAGING_TIMEOUT_MS, true);
         this.pendingAliasBinds.add(id);
-        this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace });
+        this.activeSubscriptions.set(id, { trackName, mediaType: 'video', trackAlias: null, namespace: targetNamespace, subscriberPriority: targetPriority });
         this.pendingMediaSubs.set(id, { trackName, mediaType: 'video', packaging: sw.newTrackPackaging });
         if (prefixStart) rangeOwner = this.armWarmMediaOwner(switchConn, id, prefixStart);
         if (!this.switchIsCurrent(sw)) throw new Error('Switch retired during history preparation');
@@ -3591,7 +3776,7 @@ export class MoqtPlayer {
           subscriptionRequestId: id, trackAlias: null, warmStart: true, warmOwner: rangeOwner }, switchConn);
       };
       const sending = switchConn.subscribe(nsBytes, nameBytes,
-        { ...subscribeOptions, ...this.mediaTerminalOptions(switchConn), onRequestId: (id: bigint) => register(BigInt(id)) } as never,
+        { ...subscribeOptions, subscriberPriority: varint(BigInt(targetPriority)), ...this.mediaTerminalOptions(switchConn), onRequestId: (id: bigint) => register(BigInt(id)) } as never,
       ).then(id => {
         const requestId = BigInt(id);
         if (sw.phase !== 'committed' && !this.switchIsCurrent(sw)) {
@@ -3810,6 +3995,7 @@ export class MoqtPlayer {
     const toFlush = keyframeIdx >= 0 ? staged.slice(keyframeIdx) : staged;
     for (const entry of keyframeIdx > 0 ? staged.slice(0, keyframeIdx) : []) this.discardMediaInput(entry.input, 'awaiting keyframe');
     for (const { obj: stagedObj, headers: stagedHeaders, samples, input } of toFlush) {
+      if (this.videoPipeline) this.recordDeliveredObject(stagedObj);
       if (!this.videoPipeline) this.discardMediaInput(input, 'not attached');
       else if (samples && stagedObj.kind === 'data') this.videoPipeline.pushSampleObject(stagedObj, samples, input, { allowIndependentGap: samples[0]?.chunk.type === 'key' });
       else if (input) this.videoPipeline.pushObject(stagedObj, stagedHeaders, input);
@@ -4014,6 +4200,8 @@ export class MoqtPlayer {
     try {
       for (const { trackName: stagedTrack, sourceKey, mediaType: stagedMt, groupId, objectId, payload, input } of cmafStaged) {
         if (!this.switchIsCurrent(sw)) break;
+        const alias = sw.newRequestId === null ? undefined : this.activeSubscriptions.get(sw.newRequestId)?.trackAlias;
+        if (this.cmafAssembler && alias != null && objectId !== undefined) this.recordDeliveredObject({ kind: 'data', trackAlias: alias, groupId, objectId });
         this.pushCmafInput(stagedMt, stagedTrack, groupId, payload, input, sourceKey, objectId);
         replayed++;
       }
@@ -4553,6 +4741,13 @@ export class MoqtPlayer {
           this.discardMediaInput(input, deliveryState === PlayerState.PAUSED ? 'paused' : 'route retired'); return;
         }
       }
+      if (pipeline) this.recordDeliveredObject(obj);
+      if (pipeline && (mediaType === 'video' || mediaType === 'audio') && obj.kind === 'data'
+          && !delivery?.backfill && !delivery?.fetched && headers.captureTimestamp !== undefined) {
+        const record = this.livePlaybackRecord(), previous = record?.newest.get(mediaType);
+        if (record && (previous === undefined || headers.captureTimestamp > previous)) record.newest.set(mediaType, headers.captureTimestamp);
+      }
+      if (mediaType === 'audio' && !delivery?.backfill && !delivery?.fetched) this.liveAudioObjects.add(obj);
       if (!pipeline) this.discardMediaInput(input, 'not attached');
       else if (delivery?.backfill) pipeline.pushObject(obj, headers, input, { backfill: true });
       else if (input) pipeline.pushObject(obj, headers, input);
@@ -4690,6 +4885,7 @@ export class MoqtPlayer {
       }
 
       // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
+      if (this.cmafAssembler) this.recordDeliveredObject(obj);
       const encode = mediaType === 'video' && !delivery?.backfill && !delivery?.fetched && delivery?.identity
         ? this.encodeDeliveries.get(delivery.identity) : undefined;
       const anchored = encode && encode.observation.location.groupId === String(obj.groupId)
@@ -4921,6 +5117,7 @@ export class MoqtPlayer {
     // (Guarded: destroy() may have nulled the manager during the connect await.)
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = conn.draftVersion;
 
+    this.watchPublisher(conn);
     this._stats.recordTransportConnected();
     this._stats.recordSetupComplete();
     this.emitter.emit('session_established', {
@@ -5054,7 +5251,7 @@ export class MoqtPlayer {
           try {
             const reqId = await conn.subscribe(
               nsBytes, this.enc.encode(track.name),
-              { ...(knownTrackOptions ?? {}), ...this.mediaTerminalOptions(conn), onRequestId: (id: bigint) => { knownRegisteredId = id; registerKnownSub(id); } } as never,
+              { ...(knownTrackOptions ?? {}), ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(conn), onRequestId: (id: bigint) => { knownRegisteredId = id; registerKnownSub(id); } } as never,
             );
             if (this._destroyed || this.isTerminalState() || this.connection !== conn) {
               if (knownRegisteredId === null) void conn.unsubscribe(varint(BigInt(reqId))).catch(() => { /* best effort */ });
@@ -5097,6 +5294,7 @@ export class MoqtPlayer {
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
       && gen === this.bootstrapGeneration && !this.catalogQuarantinedConns.has(conn);
     if (!live()) return;
+    if (this.publisherCatalogWait?.conn === conn) this.publisherCatalogWait.waiting = false;
     const nsBytes = encodeNamespace(this.config.namespace, this.enc);
     const nameBytes = this.enc.encode(this.config.catalogTrackName);
     const coord = this.resolvedCatalogMode(conn) === 'joining-fetch'
@@ -5158,7 +5356,7 @@ export class MoqtPlayer {
     const gen = this.bootstrapGeneration;
     const live = (): boolean => !this._destroyed && !this.isTerminalState() && this.connection === conn
       && gen === this.bootstrapGeneration && !this.catalogSlots.catalogReceived
-      && !this.catalogQuarantinedConns.has(conn);
+      && !this.catalogQuarantinedConns.has(conn) && this.mediaRecoveryOwnsConnection(conn);
     if (!live()) return;
     if (this.catalogSlots.catalogSubscribeRetryTimer !== null) return;
     let remaining = retryInterval - 1n;
@@ -5283,6 +5481,8 @@ export class MoqtPlayer {
     // last. See play() for why the announcement cannot come earlier.
     const fromState = this.applyState(PlayerState.PAUSED);
     this.subscriptionManager?.invalidateMediaInputs();
+    this.livePlaybackOwner = null;
+    this.stopLiveCatchUp();
     this.playbackIntent = false;
     this.pendingVideoSwitch?.frame?.cancelPending();
     this.seekPosition?.setPlaying(false);
@@ -5374,6 +5574,8 @@ export class MoqtPlayer {
    * @see draft-ietf-moq-msf-01 §7.2 (Timeline dependency coverage)
    */
   async seek(timeMs: number): Promise<void> {
+    this.livePlaybackOwner = null;
+    this.stopLiveCatchUp();
     if (!Number.isFinite(timeMs) || timeMs < 0) {
       throw new RangeError('Seek target must be finite and nonnegative');
     }
@@ -6139,6 +6341,7 @@ export class MoqtPlayer {
       ...(audioLanguage !== undefined ? { audioLanguage } : {}),
       rawInputs: new WeakSet(), registrations: new Map(), releasedRequests: new Set(), terminalRequests: new Set(),
       retainedBytes: 0, inputCount: 0, aborted: false, committed: false, cancel };
+    this.stopLiveCatchUp();
     this.mediaSelection = txn;
     const operation = txn;
     const abort = () => this.failMediaSelection(operation, new Error('Media selection cancelled'));
@@ -6296,6 +6499,7 @@ export class MoqtPlayer {
     if (!oldIsCurrent() || this.mediaSelection || this.currentMigration || this.pendingVideoSwitch
         || this.switchInProgress || this.pendingRetypes.size) throw new Error('Audio ownership changed during selection');
     reservedAttempt = txn;
+    this.stopLiveCatchUp();
     this.mediaSelection = txn; // final guard and reservation are synchronous
     await this.runPreparedMediaSelection(txn, cancelled);
   }
@@ -6383,6 +6587,9 @@ export class MoqtPlayer {
   }
 
   private resetMediaClock(preserveMediaInputs = false): void {
+    this.stopLiveCatchUp();
+    this.lateAudioAsksUs.length = 0;
+    this.lateAudioDebtUs = 0;
     if (!preserveMediaInputs) this.subscriptionManager?.invalidateMediaInputs();
     this.audioTimelineRecord = null;
     this.videoTimelineRecord = null;
@@ -6699,8 +6906,12 @@ export class MoqtPlayer {
       // overwritten here: the replacement is authoritative for it now.
       this.pendingMediaSubs.delete(reqId);
       sub.subscription ??= { trackName: sub.trackName, mediaType: sub.mediaType, trackAlias: sub.alias, namespace: sub.namespace };
+      // FETCH priority is independent: d14 §9.16, d16 §9.2.2.3, d18 §10.2.7.
+      sub.subscription.subscriberPriority = Number(this.subscriberPriorityFor(sub.mediaType).subscriberPriority
+        ?? this.config.subscriberPriority ?? DEFAULT_SUBSCRIBER_PRIORITY);
       this.activeSubscriptions.set(reqId, sub.subscription);
       if (sub.alias !== null) {
+        this.deliverySubscriptions.set(sub.alias, sub.subscription);
         this.subscriptionManager?.registerTrack(sub.alias, sub.trackName, sub.mediaType, sub.packaging,
           { sourceConnection: conn, namespace: sub.namespace });
       }
@@ -7095,7 +7306,7 @@ export class MoqtPlayer {
     };
     prep.controller = chosen.controller;
 
-    await this.issuePreparedMedia(txn, required, catalog, () => this.assertMigrationLive(txn));
+    await this.issuePreparedMedia(txn, required, catalog, () => this.assertMigrationLive(txn), undefined, true);
     this.revalidateCandidateSelection(prep);
 
     // ── Changed initialization: reconfigure, or decline ─────────────────
@@ -7133,7 +7344,7 @@ export class MoqtPlayer {
   /** The same request, initialization and readiness authority for either preparation. */
   private async issuePreparedMedia(txn: PreparedMediaAttempt,
     required: ReadonlyArray<{ track: CatalogTrack; mediaType: 'video' | 'audio' }>, catalog: CatalogState,
-    assertLive: () => void, onClaim?: (id: bigint) => void): Promise<void> {
+    assertLive: () => void, onClaim?: (id: bigint) => void, continuing = false): Promise<void> {
     const prep = txn.prep!;
     const conn = txn.conn;
     const subscribeOptions = buildSubscribeOptions(this.config);
@@ -7190,7 +7401,11 @@ export class MoqtPlayer {
       }) === null) throw new Error(`replacement init subscription "${name}" cancelled by beforeSubscribe`);
       const options = initKey !== null
         ? { subscriptionFilter: { type: 'AbsoluteStart' as const, startGroup: varint(0n), startObject: varint(0n) } }
-        : (subscribeOptions ?? defaultMediaSubscriptionFilter(isLive));
+        // d14/16 §9.16.2: Joining FETCH requires LargestObject even when
+        // other subscribe options are configured; an explicit filter still wins.
+        : continuing && isLive && this.config.subscriptionFilter === undefined
+          ? { ...subscribeOptions, subscriptionFilter: { type: 'LargestObject' as const } }
+          : (subscribeOptions ?? defaultMediaSubscriptionFilter(isLive));
       let allocated: bigint | null = null;
       const claim = (id: bigint): void => {
         assertLive();
@@ -7203,7 +7418,8 @@ export class MoqtPlayer {
         onClaim?.(id);
       };
       const reqId = await conn.subscribe(namespace.map(field => this.enc.encode(field)), this.enc.encode(name),
-        { ...options, ...(initKey === null ? this.mediaTerminalOptions(conn) : {}), onRequestId: claim } as never);
+        { ...options, ...(initKey === null ? { ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(conn) } : {}),
+          onRequestId: claim } as never);
       if (allocated === null) claim(BigInt(reqId));
       assertLive();
     };
@@ -7871,6 +8087,8 @@ export class MoqtPlayer {
     // retained-route ownership below is about that connection, and reading it
     // afterwards would name the replacement as its own predecessor.
     const retiring = this.connection;
+    const previousSubscriptions = [...this.activeSubscriptions.values()];
+    const ranges: Array<{ owner: WarmMediaOwner; name: string; end: { group: bigint; object: bigint } }> = [];
     if (retiring) this.cancelLivenessRestarts(retiring);
     txn.committed = true; // staging closed — further candidate events run live on the now-current session
     if (this.pendingVideoSwitch) {
@@ -7891,6 +8109,7 @@ export class MoqtPlayer {
       }
     }
     this.connection = newConnection;
+    this.watchPublisher(newConnection);
     if (this.subscriptionManager) this.subscriptionManager.draftVersion = newConnection.draftVersion;
 
     // ── Adopt what the candidate PREPARED ───────────────────────────────
@@ -8025,6 +8244,25 @@ export class MoqtPlayer {
       this.pendingAliasBinds.clear();
       this.mseCompletions = null;
       this.adoptPreparedSubscriptions(prep, txn.conn);
+      // d14/16 §9.16.2 and d18 §10.12.2 join the saved SUBSCRIBE_OK
+      // Largest. MSF-01 §5.2.7 limits this policy to ongoing live tracks.
+      if (this.config.subscriptionFilter === undefined) for (const [id, sub] of prep.media) {
+        if (prep.selection?.[sub.mediaType]?.isLive !== true || !sub.largest) continue;
+        const old = previousSubscriptions.find(old => old.trackName === sub.trackName
+          && sameNamespaceFields(old.namespace ?? namespaceFields(this.config.namespace), sub.namespace));
+        const delivered = old && this.deliveredLocations.get(old);
+        if (!delivered) continue;
+        this.deliveredLocations.set(sub.subscription!, delivered);
+        // Retire this track's old route at adoption so its delivered floor is
+        // final before the bounded prefix releases any replacement Objects.
+        if (old.trackAlias !== null) this.supersededRouting?.aliases.delete(old.trackAlias);
+        const owner = this.armWarmMediaOwner(txn.conn, id, { group: delivered.group, object: delivered.object + 1n });
+        owner?.head?.acceptLargest(sub.largest);
+        if (owner && (delivered.group < sub.largest.group
+            || delivered.group === sub.largest.group && delivered.object < sub.largest.object)) {
+          ranges.push({ owner, name: sub.trackName, end: sub.largest });
+        }
+      }
       this._mediaSubsExpected = prep.media.size;
       this._mediaSubsOk = prep.media.size;
       this._mediaSubsFailed = 0;
@@ -8065,6 +8303,7 @@ export class MoqtPlayer {
     this.quarantinedFetchRequests.clear();
     this.droppedFetchStreams.clear();
     this.rejectPendingCatalogFetches('Session migrated — fetchCatalog cancelled');
+    for (const range of ranges) this.requestWarmRange(range.owner, range.name, range.end);
   }
 
   /**
@@ -8105,7 +8344,7 @@ export class MoqtPlayer {
       this.activeSubscriptions.delete(reqId);
       this.pendingMediaSubs.delete(reqId);
     }
-    for (const alias of superseded.aliases) this.subscriptionManager?.unregisterTrack(alias);
+    for (const alias of superseded.aliases) { this.deliverySubscriptions.delete(alias); this.subscriptionManager?.unregisterTrack(alias); }
     // Current-session completion may have been waiting only for these overlap registrations to retire.
     try { this.reconsiderMseTrackEnds(); }
     catch (error) { try { this.log.warn('Track completion observer failed after retirement: %s', String(error)); } catch { /* observer failure */ } }
@@ -10031,11 +10270,135 @@ export class MoqtPlayer {
     // Proactive quality adaptation: if estimated bandwidth is below
     // 1.5× the current track's bitrate, downshift before stalls occur.
     this.checkBandwidthAdaptation();
+    this.checkLiveJump();
+    this.checkLiveCatchUp();
 
     // Media liveness: reconcile monitored tracks with the live subscription
     // map (a handful of entries — cheap at tick rate, and immune to drift
     // across subscribe/unsubscribe/switch paths), then evaluate starvation.
     this.syncAndCheckLiveness();
+  }
+
+  /** Observations belong to one ordinary live output graph, never a historical owner. */
+  private livePlaybackRecord(): MoqtPlayer['livePlaybackOwner'] {
+    if ((!this.config.liveJumpThresholdMs && (this.config.maxCatchUpRate ?? 1) <= 1) || this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
+        || this.activeLocSeek || this.activeMseSeek || this.seekIsPreparing() || this.pendingVideoSwitch || this.switchInProgress
+        || this.mediaSelection || this.currentMigration || this.pendingRetypes.size
+        || this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange') {
+      this.livePlaybackOwner = null; return null;
+    }
+    if (this.livePlaybackOwner?.current()) return this.livePlaybackOwner;
+    this.livePlaybackOwner = null;
+    this.stopLiveCatchUp();
+    const selection = this._selection, manager = this.subscriptionManager, generation = manager?.mediaInputGeneration;
+    const sync = this.syncController, dispatcher = this.commandDispatcher, connection = this.connection;
+    const video = this.videoPipeline, audio = this.audioPipeline, media = this.mediaSource;
+    const roles = (['video', 'audio'] as const).filter(role => selection[role] !== null);
+    const subscriptions = [...this.activeSubscriptions].filter(([, sub]) => roles.includes(sub.mediaType as 'video' | 'audio'));
+    if (!sync || (!dispatcher && !media) || !manager || !connection || roles.length === 0 || subscriptions.length !== roles.length
+        || roles.some(role => (!media && !(role === 'video' ? video : audio)) || this.subscribedTrack(role)?.isLive !== true)
+        || subscriptions.some(([, sub]) => sub.trackAlias === null || sub.trackName !== selection[sub.mediaType as 'video' | 'audio']?.name)) return null;
+    const routes = subscriptions.map(([, sub]) => manager.captureRoute(sub.trackAlias!));
+    const current = () => this.connection === connection && this._selection === selection && this.subscriptionManager === manager
+      && manager.mediaInputGeneration === generation && this.syncController === sync && this.commandDispatcher === dispatcher
+      && this.videoPipeline === video && this.audioPipeline === audio && this.mediaSource === media && routes.every(route => route?.())
+      && roles.every(role => this.subscribedTrack(role)?.isLive === true)
+      && subscriptions.every(([id, sub]) => this.activeSubscriptions.get(id) === sub && !this.terminalMediaSubscriptions.has(sub));
+    const loc: PlaybackRateOutput | null = this.locRateOutput;
+    const element = media?.setPlaybackRate && media.getBufferAheadUs ? media : null;
+    const output: PlaybackRateOutput | null = (media && !element) || ((video || audio) && !loc) ? null : {
+      latencyUs: () => loc?.latencyUs?.() ?? null,
+      getBufferAheadUs: () => {
+        const a = element ? element.getBufferAheadUs!() : Infinity, b = loc ? loc.getBufferAheadUs() : Infinity;
+        return a === null || b === null ? null : Math.min(a, b);
+      },
+      setPlaybackRate: rate => { element?.setPlaybackRate!(rate);
+        if (rate === 1 || this.livePlaybackRecord()?.output === output) loc?.setPlaybackRate(rate); },
+    };
+    const tracks = roles.map(role => this.subscribedTrack(role)!);
+    const floorUs = Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
+    const target = this.config.targetLatencyMs ?? tracks.find(track => track.targetLatency !== undefined)?.targetLatency;
+    return this.livePlaybackOwner = { current, output, floorUs, targetUs: target === undefined ? undefined : target * 1000, newest: new Map(), since: null };
+  }
+
+  private checkLiveJump(): void {
+    const record = this.livePlaybackRecord(), sync = this.syncController;
+    if (!this.config.liveJumpThresholdMs || !record || !sync?.hasReference || !this.commandDispatcher) return;
+    const roles = (['video', 'audio'] as const).filter(role => this._selection[role] !== null);
+    const ahead = Math.min(...roles.map(role => {
+      const newest = record.newest.get(role);
+      return newest === undefined ? -Infinity : sync.computeAudioRenderTime(newest)?.offsetUs ?? -Infinity;
+    }));
+    const now = this.clock.now();
+    if (this.livePlaybackRecord() !== record) return;
+    if (ahead <= this.config.liveJumpThresholdMs! * 1000) { record.since = null; return; }
+    record.since ??= now;
+    if (now - record.since < LIVE_JUMP_SUSTAIN_US || now - this.lastLiveJumpUs < LIVE_JUMP_COOLDOWN_US) return;
+    const byUs = ahead - LIVE_JUMP_CUSHION_US;
+    if (byUs <= 0) return;
+    sync.advanceReference(byUs);
+    this.lateAudioDebtUs = Math.max(0, this.lateAudioDebtUs - byUs);
+    this.lastLiveJumpUs = now;
+    record.since = null;
+    const dispatcher = this.commandDispatcher!;
+    dispatcher.flush();
+    // LOC audio is independently decodable; retire decodes carrying pre-jump render times.
+    dispatcher.dispatch({ type: 'reset', mediaType: 'audio', reason: 'live latency jump' });
+    this.emitter.emit('recovery_action', { type: 'recovery_action',
+      action: { type: 'jump_to_live', trigger: 'latency', byMs: Math.round(byUs / 1000) } });
+  }
+
+  private stopLiveCatchUp(): void {
+    this.catchUpOwner = null;
+    const changed = this.liveCatchUp?.currentRate !== undefined && this.liveCatchUp.currentRate !== 1;
+    this.liveCatchUp?.reset();
+    if (changed) {
+      this.catchUpStopped = { type: 'catch_up_changed', active: false, rate: 1,
+        latencyMs: Math.round(this.liveCatchUp!.latencyUs / 1000), targetMs: this.liveCatchUp!.targetUs / 1000 };
+      queueMicrotask(() => { if (!this._destroyed) this.publishCatchUpStop(); });
+    }
+  }
+
+  private publishCatchUpStop(): void {
+    const event = this.catchUpStopped; this.catchUpStopped = null;
+    if (event) try { this.emitter.emitIsolated('catch_up_changed', event); }
+    catch (error) { try { this.log.warn('Catch-up observer failed: %s', String(error)); } catch { /* Observer only. */ } }
+  }
+
+  private checkLiveCatchUp(): void {
+    if ((this.config.maxCatchUpRate ?? 1) <= 1) return;
+    this.publishCatchUpStop();
+    const owner = this.livePlaybackRecord();
+    if (!owner?.output) { this.stopLiveCatchUp(); return; }
+    if (this.catchUpOwner !== owner) { this.stopLiveCatchUp(); this.liveCatchUp = null; this.catchUpOwner = owner; }
+    const policy = this.liveCatchUp ??= new LiveCatchUp({ maxRate: this.config.maxCatchUpRate!,
+      thresholdUs: this.config.catchUpThresholdMs! * 1000, recoveryUs: this.config.catchUpRecoveryMs! * 1000,
+      floorAheadUs: owner.floorUs });
+    const now = this.clock.now();
+    if (this.livePlaybackRecord() !== owner) { this.stopLiveCatchUp(); return; }
+    const decision = policy.tick(owner.output, now, () => this.livePlaybackRecord() === owner, owner.targetUs);
+    if (this.livePlaybackRecord() !== owner) { this.stopLiveCatchUp(); return; }
+    if (decision) this.emitter.emit('catch_up_changed', { type: 'catch_up_changed', active: decision.active,
+      rate: decision.rate, latencyMs: Math.round(policy.latencyUs / 1000), targetMs: (owner.targetUs ?? 0) / 1000 });
+  }
+
+  /** Require 300 ms of uninterrupted lateness; bound added latency until it is repaid. */
+  private absorbLateAudio(offsetUs: number, object: object, pipeline: PlaybackPipeline, sync: SyncController): boolean {
+    const now = this.clock.now(), dispatcher = this.commandDispatcher;
+    if (offsetUs >= 0 || this.audioPipeline !== pipeline || this.syncController !== sync || !sync.hasReference || !dispatcher
+        || this.state !== PlayerState.PLAYING || this.playbackIntent !== true || this.seekIsPreparing() || this.activeMseSeek
+        || this.pendingVideoSwitch || this.switchInProgress || this.mediaSelection || !this.liveAudioObjects.has(object)
+        || now - this.lastLiveJumpUs < LATE_AUDIO_SETTLE_US) { this.lateAudioAsksUs.length = 0; return false; }
+    this.lateAudioAsksUs[0] ??= now;
+    if (now - this.lateAudioAsksUs[0] < LATE_AUDIO_WINDOW_US) return false;
+    const byUs = Math.min(-offsetUs + LATE_AUDIO_HEADROOM_US, this.config.liveJumpThresholdMs! * 1000 - this.lateAudioDebtUs);
+    if (byUs <= -offsetUs) return false;
+    this.lateAudioAsksUs.length = 0;
+    this.lateAudioDebtUs += byUs;
+    sync.slipReference(byUs);
+    dispatcher.flush();
+    dispatcher.dispatch({ type: 'reset', mediaType: 'audio', reason: 'sustained late audio' });
+    return true;
   }
 
   /** Throttle for sync_skew diagnostic events (~1/s). */
@@ -10301,6 +10664,7 @@ export class MoqtPlayer {
   async destroy(): Promise<void> {
     if (this._destroyed) return;
     this._destroyed = true;
+    this.stopLiveCatchUp();
     const retirementFailures: unknown[] = [];
     for (const retire of [() => this.retireMseSeek(this.preparingMseSeek), () => this.retireMseSeek(this.activeMseSeek),
       () => this.retireLocSeek(this.preparingLocSeek), () => this.retireLocSeek(this.activeLocSeek)]) {
@@ -10312,7 +10676,8 @@ export class MoqtPlayer {
     try { seekOutput?.resource.cancel(); } catch (error) { retirementFailures.push(error); }
     let closedCandidate: MoqtConnection | null = null;
     try {
-      this.receivingVideoOwners.clear();
+      this.deliverySubscriptions.clear();
+      this.receivingMediaOwners.clear();
       this.audioOutput = null; this.lastAudioDomainOwner = null; this.lastAudioDomain = null;
       this.installedDecoderConfigurations.clear(); this.preparedDecoderConfigurations.clear(); this.decoderConfigurationCommands.clear();
       this.audioTimelineRecord = null; this.videoTimelineRecord = null; this.collectAudioTimeline = false; this.collectVideoTimeline = false; this.selectedOutputOwners.clear(); this.runtimeAudioIntent = null; this.runtimeAudioLanguage = null; this.runtimeSelectionIntent = null; this.mappedClockOwner = null; this.videoPresentationOffsetUs = 0n; this.videoTimingMapped = false; this.videoTimingSource = undefined; this.audioPresentationOffsetUs = 0n; this.audioTimingMapped = false; this.audioTimingSource = undefined;
@@ -10477,6 +10842,7 @@ export class MoqtPlayer {
       for (const listener of destroyObservers ?? []) {
         try { listener(); } catch (error) { try { this.log.warn('Destroy observer failed: %s', String(error)); } catch { /* observer failure */ } }
       }
+      this.publishCatchUpStop();
       this.emitter.removeAllListeners();
     }
     if (retirementFailures.length === 1) throw retirementFailures[0];
@@ -10498,6 +10864,12 @@ export class MoqtPlayer {
     delete conn.onDataStream;
     delete conn.onStreamClosed;
     delete conn.onDatagram;
+    if (this.publisherCatalogWait?.conn === conn) {
+      clearTimeout(this.publisherCatalogWait.timer); this.publisherCatalogWait = null;
+    }
+    const watch = this.publisherWatches.get(conn);
+    watch?.releasePublish();
+    if (watch) void watch.id.then(id => { if (id !== null) return conn.cancelNamespace(id); }).catch(() => {});
     delete conn.onNamespaceMessage;
     delete conn.onQlogEvent;
     delete conn.onSubgroupFin;
@@ -11682,6 +12054,7 @@ export class MoqtPlayer {
       // §6.1: Namespace discovery messages (bidi-stream NAMESPACE / NAMESPACE_DONE)
       // §6.2: Control-stream PUBLISH_NAMESPACE / PUBLISH_NAMESPACE_DONE
       onNamespaceMessage: stageable((requestId, msg) => {
+        void this.publisherAnnouncement(conn, requestId, msg);
         switch (msg.type) {
           case 'NAMESPACE':
             this.emitter.emit('namespace_discovered', {
@@ -12024,6 +12397,7 @@ export class MoqtPlayer {
         if (msg.type === 'SUBSCRIBE_OK' && 'trackAlias' in msg) {
           // ACCEPTANCE — the §7.4.1 precondition for retiring the old
           // subscriptions. Sending the request proved nothing.
+          if (sub) sub.largest = extractLargestLocation(msg.parameters);
           this.onCandidateSubscribeAccepted(txn!, reqId, BigInt((msg as { trackAlias: bigint | number }).trackAlias));
         } else if (msg.type === 'REQUEST_ERROR') {
           const what = sub !== undefined ? `track "${sub.trackName}"` : `init track "${initName!}"`;
@@ -12264,8 +12638,9 @@ export class MoqtPlayer {
               && restart.active && this.livenessLadderMayContinue(restart)) {
             // Draft14 SUBSCRIBE_ERROR has no Retry Interval; its codec's zero
             // placeholder is not a peer instruction against retry (draft14 §9.9).
-            restart.refusal = { retryInterval: conn.session.draftVersion === 14 ? null : retryInterval,
+            restart.refusal = { errorCode, retryInterval: conn.session.draftVersion === 14 ? null : retryInterval,
               atMs: performance.now() };
+            if (restart.announced) restart.wake?.();
           }
         }
         this._mediaSubsFailed++;
@@ -12284,11 +12659,18 @@ export class MoqtPlayer {
         }
       },
       onCatalogSubscribeOk: (largest) => {
+        if (this.publisherCatalogWait?.conn === conn) {
+          clearTimeout(this.publisherCatalogWait.timer); this.publisherCatalogWait = null;
+        }
         slots?.catalogBootstrapCoord?.onSubscribeOk(largest);
       },
       onCatalogSubscribeError: (errorCode, reason, retryInterval) => {
         if (conn !== this.connection) return;
         this.cancelCatalogBootstrap();
+        if (errorCode === (conn.draftVersion === 14 ? 0x4n : BigInt(RequestError.DOES_NOT_EXIST)) && this.config.publisherWaitMs! > 0 && !this.catalogSlots.catalogReceived) {
+          void this.waitForPublisherCatalog(conn, reason, retryInterval);
+          return;
+        }
         // Only "not published yet" is retriable; other codes are real refusals.
         if (errorCode !== BigInt(RequestError.DOES_NOT_EXIST) || retryInterval === 0n) {
           this.failCatalogPlayback(createPlayerError(
@@ -12489,6 +12871,8 @@ export class MoqtPlayer {
           requestId, fetchInfo.trackName, errorReason, errorCode.toString(16));
       },
       onMediaAliasBound: (requestId, alias) => {
+        const sub = this.activeSubscriptions.get(requestId);
+        if (sub) this.deliverySubscriptions.set(alias, sub);
         // The current session has bound this alias, so it is no longer a
         // retired session's route — whatever that session still sends on it
         // belongs to nobody.
@@ -12919,7 +13303,7 @@ export class MoqtPlayer {
 
           this.emitter.emit('recovery_action', {
             type: 'recovery_action',
-            action: { type: 'jump_to_live' },
+            action: { type: 'jump_to_live', trigger: 'stalls' },
           });
           return;
         }
@@ -12935,6 +13319,7 @@ export class MoqtPlayer {
           });
           doRecoveryAction(action, 'video', this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
+              if (!this.mediaRecoveryOwnsConnection(this.connection)) return;
               // No stats here — deferred to completePendingVideoSwitch.
               this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
                 this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
@@ -12953,6 +13338,16 @@ export class MoqtPlayer {
       onDecodeError: (mediaType, error) => {
         if (!ownsCommands()) return;
         if (this.stateMachine.state === PlayerState.ERROR) return;
+        if (error.name === 'MediaGapUnrecoverableError') {
+          const selected = this._selection.video;
+          const track = selected && this.catalogTrackFor(selected.name, selected.namespaceFields, 'video');
+          if (track?.isLive === true && this.config.subscriptionFilter === undefined
+              && !this.pendingVideoSwitch && !this.switchInProgress && !this.mediaSelection && !this.currentMigration
+              && !this.seekIsPreparing() && !this.activeMseSeek && !this.ownedSeekOutput) {
+            try { if (this.mediaSource?.tryRecoverBufferedGap?.(error) === true) return; }
+            catch { /* A failed recovery attempt must not suppress fatal escalation. */ }
+          }
+        }
         this._stats.recordDecodeError();
 
         // MSE playhead-wedge ladder exhausted (Safari frozen-element class):
@@ -13071,7 +13466,7 @@ export class MoqtPlayer {
         this.consecutiveStallCount = 0;
       },
       onFeedback: (fb) => { if (ownsCommands()) this.handleFeedback(fb); },
-      onCommand: (cmd) => { if (ownsCommands()) this.handlePipelineCommand(cmd); },
+      onCommand: (cmd) => { if (ownsCommands()) this.handlePipelineCommand(this.locRateOutput?.command(cmd) ?? cmd); },
       onEvent: (mediaType, evt) => { if (ownsCommands()) this.handlePipelineEvent(mediaType, evt); },
       // A/V skew observability (LOC): record every sample, emit ~1/s.
       onAvSkew: (skewUs) => {
@@ -13096,6 +13491,24 @@ export class MoqtPlayer {
     this.videoPipeline = pipelines.videoPipeline;
     this.audioPipeline = pipelines.audioPipeline;
     this.syncController = pipelines.syncController;
+    const outputs = pipelines.frameOutput;
+    this.locRateOutput = (this.config.maxCatchUpRate ?? 1) > 1 && !!(pipelines.videoPipeline || pipelines.audioPipeline)
+      && (!pipelines.videoPipeline || outputs?.renderer?.setPlaybackRate)
+      && (!pipelines.audioPipeline || outputs?.audioOutput?.setPlaybackRate
+        && outputs.audioOutput.supportsOutputTiming && outputs.audioDecoder?.supportsOutputTiming)
+      ? new LocRateOutput(pipelines.syncController, this.clock, outputs?.renderer, outputs?.audioOutput, () => {
+          const owner = this.livePlaybackOwner;
+          const roles = (['video', 'audio'] as const).filter(role => role === 'video' ? pipelines.videoPipeline : pipelines.audioPipeline);
+          if (!owner || !pipelines.syncController.hasReference || roles.some(role => !owner.newest.has(role))) return null;
+          return Math.min(...roles.map(role => role === 'audio'
+            ? (this.audioTimingSource ?? pipelines.syncController).computeAudioRenderTime(owner.newest.get(role)!)?.offsetUs ?? 0
+            : (this.videoTimingSource ?? pipelines.syncController).computeVideoRenderTime(owner.newest.get(role)!)?.offsetUs ?? 0));
+        }, () => pipelines.getRenderCushionUs?.() ?? 0,
+        byUs => { this.lateAudioDebtUs = Math.max(0, this.lateAudioDebtUs - byUs); }) : null;
+    this.lateAudioAsksUs.length = 0;
+    this.lateAudioDebtUs = 0;
+    if (pipelines.audioPipeline) pipelines.audioPipeline.lateAudioHandler = (offset, object) =>
+      this.absorbLateAudio(offset, object, pipelines.audioPipeline!, pipelines.syncController!);
     this.recoveryController = pipelines.recoveryController;
     this.commandDispatcher = pipelines.commandDispatcher;
     owningDispatcher = pipelines.commandDispatcher;
@@ -13144,7 +13557,7 @@ export class MoqtPlayer {
         // Emergency downshift: non-mutating peek, deferred commit.
         if (this.qualityController && this.bufferAbrController) {
           const newTrack = this.qualityController.peekLowerVideoQuality(true);
-          if (newTrack) {
+          if (newTrack && this.mediaRecoveryOwnsConnection(this.connection)) {
             this.lastAbrDownshiftUs = this.clock.now();
             this.log.warn('MSE stall %dms → emergency downshift to %s', durationMs, newTrack.name);
             this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
@@ -13755,7 +14168,8 @@ export class MoqtPlayer {
       let reqIdBigInt: bigint;
       try {
         const reqId = await conn.subscribe(nsBytes, nameBytes,
-          { ...mediaOptions, ...this.mediaTerminalOptions(conn), onRequestId: (id: bigint) => { registeredId = id; registerMediaSub(id); } } as never);
+          { ...mediaOptions, ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(conn),
+            onRequestId: (id: bigint) => { registeredId = id; registerMediaSub(id); } } as never);
         reqIdBigInt = BigInt(reqId);
         if (!live()) {
           if (registeredId === null) void conn.unsubscribe(varint(reqIdBigInt)).catch(() => { /* best effort */ });
@@ -14026,7 +14440,8 @@ export class MoqtPlayer {
     };
     try {
       const reqId = await conn.subscribe(nsBytes, nameBytes,
-        { ...((options as object | undefined) ?? {}), ...(info.packaging !== 'init' ? this.mediaTerminalOptions(conn) : {}), onRequestId: (id: bigint) => register(BigInt(id)) } as never);
+        { ...((options as object | undefined) ?? {}),
+          ...(info.packaging !== 'init' ? { ...this.subscriberPriorityFor(info.mediaType), ...this.mediaTerminalOptions(conn) } : {}), onRequestId: (id: bigint) => register(BigInt(id)) } as never);
       if (!live()) {
         if (registered === null) void conn.unsubscribe(varint(BigInt(reqId))).catch(() => { /* best effort */ });
         throw new Error('Auxiliary subscription retired during emission');
@@ -14136,7 +14551,6 @@ export class MoqtPlayer {
     // Stats: record event-level metrics before delegating
     if (evt.type === 'gap_detected') this._stats.recordGapDetected();
     if (evt.type === 'recovery') this._stats.recordRecoveryAction();
-    if (evt.type === 'catch_up_changed') this._stats.recordLatency(evt.state.latencyMs);
     if (evt.type === 'partial_group_abandoned' && mediaType === 'video') {
       this.lastLocPartialAbandonUs = this.clock.now();
       this.locHealthyRenderCount = 0;
@@ -14155,6 +14569,7 @@ export class MoqtPlayer {
         if (result) {
           doRecoveryAction(result, mediaType, this.qualityController, this.log, {
             onQualityReduced: (newTrack) => {
+              if (!this.mediaRecoveryOwnsConnection(this.connection)) return;
               this.selectVideoTrack({ name: newTrack.name, namespace: trackNamespaceFields(newTrack, this.config.namespace) }, 'recovery', 'downshift').catch((err) => {
                 this.log.warn('Quality switch to "%s" failed: %s', newTrack.name, err);
               });
@@ -14251,6 +14666,11 @@ export class MoqtPlayer {
    * that delivers exactly one object before dying is still armed.
    */
   private stampMediaArrival(trackAlias: bigint): void {
+    const watch = this.connection && this.publisherWatches.get(this.connection);
+    if (watch?.withdrawn.size) for (const sub of this.activeSubscriptions.values()) {
+      if (sub.trackAlias === trackAlias) watch.withdrawn.get(JSON.stringify(
+        sub.namespace ?? namespaceFields(this.config.namespace)))?.delete(sub.trackName);
+    }
     const monitor = this.livenessMonitor;
     if (!monitor) return;
     const nowMs = performance.now();
@@ -14295,19 +14715,25 @@ export class MoqtPlayer {
     track: LivenessTrack,
     starvedForMs: number,
     healthyForMs: number,
+    announced?: readonly string[],
   ): Promise<void> {
     const connection = this.connection;
     if (!this.mediaRecoveryOwnsConnection(connection)) return;
     const issued = this.activeSubscriptions.get(track.requestId);
-    if (!issued || this.terminalMediaSubscriptions.has(issued)) return;
-    const namespace = [...(issued.namespace ?? namespaceFields(this.config.namespace))];
+    if ((!issued && !announced) || (issued && this.terminalMediaSubscriptions.has(issued))) return;
+    const namespace = [...(announced ?? issued?.namespace ?? namespaceFields(this.config.namespace))];
     const key = JSON.stringify([namespace, track.trackName, track.mediaType]);
     let restart = this.livenessRestarts.get(key);
-    if (!restart || restart.connection !== connection || !restart.ownsOutput()) {
+    // A changed publisher presence only exempts a DOES_NOT_EXIST refusal.
+    if (announced && restart?.refusal?.retryInterval === 0n
+        && restart.refusal.errorCode !== BigInt(RequestError.DOES_NOT_EXIST)) return;
+    if (announced && restart?.refusal?.retryInterval && restart.refusal.retryInterval > 0n
+        && BigInt(Math.max(0, Math.floor(performance.now() - restart.refusal.atMs))) < restart.refusal.retryInterval - 1n) return;
+    if (announced || !restart || restart.connection !== connection || !restart.ownsOutput()) {
       if (restart) restart.cancelled = true;
       const output = this.selectedOutputOwners.get(track.mediaType);
       const generation = this.bootstrapGeneration;
-      restart = { attempts: 0, active: false, cancelled: false, connection,
+      restart = { track, announced: !!announced, attempts: 0, active: false, cancelled: false, connection,
         namespace, mediaType: track.mediaType, trackName: track.trackName,
         requestId: track.requestId, refusal: null, failure: null,
         ownsOutput: () => this.bootstrapGeneration === generation
@@ -14315,7 +14741,7 @@ export class MoqtPlayer {
       };
       this.livenessRestarts.set(key, restart);
     }
-    if (restart.active) return;
+    if (restart.active || (!announced && restart.announced && this.livenessRetryRefused(restart))) return;
 
     // A pending video switch already implies a fresh subscription — let it
     // finish (it has its own staging timeout). If the track is still starved
@@ -14361,7 +14787,7 @@ export class MoqtPlayer {
         if (!this.livenessLadderMayContinue(restart)) return;
         this.flushForLivenessRestart(track);
         if (!this.livenessLadderMayContinue(restart)) return;
-        const refreshed = attempt === 1 && await this.tryRefreshSubscription(track, restart);
+        const refreshed = !announced && attempt === 1 && await this.tryRefreshSubscription(track, restart);
         if (!this.livenessLadderMayContinue(restart)) return;
         if (refreshed) {
           this.log.info('Liveness: refreshed %s "%s" via REQUEST_UPDATE (attempt %d)',
@@ -14372,13 +14798,19 @@ export class MoqtPlayer {
         }
 
         // A replacement updates the owned request ID before it reaches the wire.
-        if (await this.waitForTrackArrival(attemptStartMs, this.config.livenessTimeoutMs!, restart)) {
+        if (await this.waitForTrackArrival(attemptStartMs, this.config.livenessTimeoutMs! || (announced ? this.config.publisherWaitMs! : 0), restart)) {
           this.log.info('Liveness: %s "%s" recovered on attempt %d',
             track.mediaType, track.trackName, attempt);
           return;
         }
         // REQUEST_ERROR Retry Interval 0 advises against retrying as sent
         // (draft18 §10.6, draft22 §9.4). Do not turn it into a fresh incident.
+        if (announced) {
+          const refusal = restart.refusal as LivenessRestart['refusal'];
+          if (!restart.failure && refusal?.errorCode === (connection.draftVersion === 14 ? 4n : BigInt(RequestError.DOES_NOT_EXIST)))
+            await this.waitForTrackArrival(refusal.atMs, this.config.publisherWaitMs! - (performance.now() - refusal.atMs), restart, true);
+          break;
+        }
         if (restart.failure || this.livenessRetryRefused(restart)) break;
       }
 
@@ -14866,18 +15298,21 @@ export class MoqtPlayer {
     sinceMs: number,
     timeoutMs: number,
     restart: LivenessRestart,
+    awaitingAnnouncement = false,
   ): Promise<boolean> {
     const deadline = performance.now() + timeoutMs;
     const pollMs = Math.min(250, Math.max(10, timeoutMs / 5));
     // Arrival is checked AFTER each sleep too — an object landing between
     // the final poll and the deadline must count as recovery.
     for (;;) {
-      if (!this.livenessLadderMayContinue(restart) || restart.refusal || restart.failure) return false;
+      if (!this.livenessLadderMayContinue(restart) || (!awaitingAnnouncement && restart.refusal) || restart.failure) return false;
       const last = this.livenessMonitor?.lastArrivalForRequest(restart.requestId);
       if (last !== undefined && last >= sinceMs) return true;
       const remaining = deadline - performance.now();
       if (remaining <= 0) return false;
-      await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
+      let timer: ReturnType<typeof setTimeout>;
+      await new Promise<void>(resolve => { restart.wake = resolve; timer = setTimeout(resolve, Math.min(pollMs, remaining)); });
+      clearTimeout(timer!); delete restart.wake;
     }
   }
 
@@ -15080,8 +15515,10 @@ export class MoqtPlayer {
     // publishing: a recovery listener may synchronously destroy or migrate the
     // player, and `this.connection` is mutable. Announcing afterwards also
     // makes the event's contract true — the replacement has really started.
+    if (restart?.announced) restart.requestId = -1n; // No replacement owns an arrival until allocation.
     const pending = resubConn.subscribe(nsBytes, nameBytes,
-      { ...(filter ?? {}), ...this.mediaTerminalOptions(resubConn), onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
+      { ...(filter ?? {}), ...this.subscriberPriorityFor(mediaType), ...this.mediaTerminalOptions(resubConn),
+        onRequestId: (id: bigint) => registerResub(BigInt(id)) } as never,
     ).then((reqId) => {
       const reqIdBigInt = BigInt(reqId);
       if (!live()) return;
@@ -15102,7 +15539,7 @@ export class MoqtPlayer {
       if (resubRegisteredId !== null) {
         this.retireMediaSubscription(resubRegisteredId, resubConn);
       }
-      if (restart) restart.failure = 'replacement subscription could not be sent';
+      if (restart) { restart.failure = 'replacement subscription could not be sent'; if (restart.announced) restart.wake?.(); }
       const failure = err instanceof Error ? err : new Error('Subscription send failed');
       this.log.warn('Resubscribe "%s" failed: %s', trackName, failure.message);
       this.emitError(createPlayerError(
@@ -15135,6 +15572,7 @@ export class MoqtPlayer {
 
   /** Stop pipeline tick interval. */
   private stopTicking(): void {
+    this.stopLiveCatchUp();
     if (this.tickInterval) {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
@@ -15501,6 +15939,7 @@ export class MoqtPlayer {
       } catch (error) { fail(error); }
     };
     this.revokeVideoSwitchRecovery();
+    this.stopLiveCatchUp();
     this.pendingVideoSwitch = sw;
     this.armVideoSwitchTimeout(sw, this.config.connectionTimeoutMs || SWITCH_STAGING_TIMEOUT_MS, true);
     try {

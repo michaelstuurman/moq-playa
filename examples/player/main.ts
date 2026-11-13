@@ -1368,6 +1368,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         ? { maxHeight: resHeight } : undefined;
 
     const p = new MoqtPlayer({
+        publisherWaitMs: 20_000,
         url: relayUrl,
         namespace: namespaceArg,
         ...(msfLink ? { catalogTrackName: msfLink.catalogTrackName } : {}),

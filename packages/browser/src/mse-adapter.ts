@@ -20,6 +20,7 @@ import {
   filterInitSegment,
   describeBoxes,
   peekSegmentMetadata,
+  readMdhdTimescale,
   readSegmentTimeRanges,
   readTrexDefaults,
   type SegmentTimeRange,
@@ -840,7 +841,7 @@ export class MseMediaSource implements MediaSourceLike {
   private wedgeSeekTarget: number | null = null;
 
   // ── Buffered-hole gap-jump state (fully separate from wedge state) ──
-  /** Holes wider than this are never jumped (escalate instead). */
+  /** Holes wider than this require owned recovery (otherwise escalate). */
   private static readonly GAP_JUMP_MAX_HOLE_SEC = 2.0;
   /** Minimum spacing between jumps (swiss-cheese streams keep jumping, bounded). */
   private static readonly GAP_JUMP_MIN_INTERVAL_MS = 5_000;
@@ -859,6 +860,7 @@ export class MseMediaSource implements MediaSourceLike {
   private gapCandidate: {
     curEnd: number; nextStart: number; armedAtMs: number; kind: 'combined' | 'video';
     wideWarned: boolean; spent: boolean;
+    floors: ReadonlyMap<string, bigint>;
   } | null = null;
   /** Own last-observed playhead — never reads or writes wedgeLastTime. */
   private gapLastPlayheadTime: number | null = null;
@@ -936,6 +938,7 @@ export class MseMediaSource implements MediaSourceLike {
   /** Orders append submissions; distinct from the diagnostic ring's counter. */
   private submitSeq = 0;
   private switchRecovery: SwitchRecoveryState | null = null;
+  private recoverableGapError: Error | null = null;
   /** Generation of the current SourceBuffer set; bumped on reset/destroy. */
   private bufferGen = 0;
   /** Ownership lasts through updateend, including the updating=false interval. */
@@ -950,6 +953,8 @@ export class MseMediaSource implements MediaSourceLike {
   /** trex defaults from the init segment, per media type. */
   private videoTrex: TrexDefaults | undefined;
   private audioTrex: TrexDefaults | undefined;
+  /** mdhd timescale from the same init, or null when it declares none. */
+  private readonly timescale: { video: number | null; audio: number | null } = { video: null, audio: null };
   /** MIME selected at SourceBuffer creation or by the last successful retype. */
   private readonly bufferMime: { video: string | null; audio: string | null } =
     { video: null, audio: null };
@@ -1479,6 +1484,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(videoInit);
             const first = trexMap.values().next();
             if (!first.done) this.videoTrex = first.value;
+            this.timescale.video = readMdhdTimescale(videoInit);
             const vb = this.videoBuffer;
             this.runMutation('video', 'init-append', () => vb.appendBuffer(videoInit.buffer as ArrayBuffer));
           }
@@ -1501,6 +1507,7 @@ export class MseMediaSource implements MediaSourceLike {
             const trexMap = readTrexDefaults(audioInit);
             const first = trexMap.values().next();
             if (!first.done) this.audioTrex = first.value;
+            this.timescale.audio = readMdhdTimescale(audioInit);
             const ab = this.audioBuffer;
             this.runMutation('audio', 'init-append', () => ab.appendBuffer(audioInit.buffer as ArrayBuffer));
           }
@@ -1632,6 +1639,13 @@ export class MseMediaSource implements MediaSourceLike {
     return chosen;
   }
 
+  // Receiver policy beyond CMAF contiguity (LOCMAF-01 §12.2): tolerate up to
+  // 1 ms, never a larger gap. Unknown timescales stay exact.
+  private contiguousSlack(mediaType: 'video' | 'audio'): bigint {
+    const timescale = this.timescale[mediaType];
+    return timescale === null ? 0n : BigInt(timescale) / 1000n;
+  }
+
   private holdAppendGap(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
     const generation = this.bufferGen;
     delete entry.skipsGap;
@@ -1642,6 +1656,9 @@ export class MseMediaSource implements MediaSourceLike {
     // The first segment anchors the clock. Unknown layouts retain the existing
     // fail-open policy; tick values are compared only within this track/context.
     if (!ranges?.length || end === undefined || ranges[0]!.startTime <= end) return false;
+    const media = ranges.filter(r => r.sampleCount > 0 && r.endTime > r.startTime);
+    const gaps = media.reduce((sum, r, i) => { const gap = r.startTime - (media[i - 1]?.endTime ?? end); return sum + (gap > 0n ? gap : 0n); }, 0n);
+    if (media.length && gaps <= this.contiguousSlack(mediaType)) return false;
     const previous = this.appendGapWait[mediaType];
     const now = performance.now();
     entry.waitStartedAt ??= now;
@@ -1652,7 +1669,8 @@ export class MseMediaSource implements MediaSourceLike {
     // Same-group accepted transforms may complete out of order. FIN releases only
     // that stream, after its accepted async work. Without such evidence use
     // the ordinary 250ms policy, including fully received sparse groups.
-    const receiving = entry.groupId !== undefined && this.currentReceivingGroups(mediaType)
+    // Audio receiving evidence gates hole recovery only, not ordinary append timing.
+    const receiving = mediaType === 'video' && entry.groupId !== undefined && this.currentReceivingGroups(mediaType)
       .some(group => group.trackIdentity === entry.trackIdentity && group.groupId <= entry.groupId!);
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
     if (this.destroyed || generation !== this.bufferGen || !queue.includes(entry) || this.changingType[mediaType]) return true;
@@ -1925,6 +1943,7 @@ export class MseMediaSource implements MediaSourceLike {
       const trex = Array.from(trexMap.values())[0];
       if (mediaType === 'video') this.videoTrex = trex;
       else this.audioTrex = trex;
+      this.timescale[mediaType] = readMdhdTimescale(filtered);
 
       // Refresh init summary so failure dumps reflect the current codec.
       const boxes = describeBoxes(filtered);
@@ -2056,6 +2075,15 @@ export class MseMediaSource implements MediaSourceLike {
     } catch { return null; }
   }
 
+  private originalPitch: boolean | undefined;
+  /** Change the shared element rate while preserving audio pitch. */
+  setPlaybackRate(rate: number): void {
+    if (rate !== 1) this.originalPitch ??= this.video.preservesPitch;
+    this.video.preservesPitch = rate === 1 ? this.originalPitch ?? this.video.preservesPitch : true;
+    if (rate === 1) this.originalPitch = undefined;
+    this.video.playbackRate = rate;
+  }
+
   getBufferAheadUs(): number | null {
     const v = this.video;
     if (!v.buffered.length) {
@@ -2181,6 +2209,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.changingType.audio = false;
     this.videoTrex = undefined;
     this.audioTrex = undefined;
+    this.timescale.video = this.timescale.audio = null;
     this.seenDiagnostics.clear();
     this.quotaRetried.video = false;
     this.quotaRetried.audio = false;
@@ -3152,6 +3181,13 @@ export class MseMediaSource implements MediaSourceLike {
       || (this.nativeRanges(this.audioBuffer)?.some(([start, end]) => start <= nextStart + tol && end > nextStart) ?? false);
   }
 
+  /** See {@link MediaSourceLike.tryRecoverBufferedGap}. */
+  tryRecoverBufferedGap(error: Error): boolean {
+    if (error !== this.recoverableGapError || this.recoverableGapError === null) return false;
+    this.recoverableGapError = null; // One synchronous attempt for this exact escalation.
+    return this.checkGapJump(performance.now(), true) === true;
+  }
+
   /** Drop the armed hole candidate (wait restarts on the next sighting). */
   private disarmGap(): void {
     this.gapCandidate = null;
@@ -3180,7 +3216,7 @@ export class MseMediaSource implements MediaSourceLike {
 
   /**
    * Detect a playhead frozen at a buffered hole and, after a bounded wait,
-   * seek just past it. Holes wider than GAP_JUMP_MAX_HOLE_SEC never jump;
+   * seek just past it. Wider holes require switch recovery or player permission;
    * if one persists GAP_WIDE_HOLE_FATAL_MS it escalates exactly once via
    * onError with name 'MediaGapUnrecoverableError' (the same name-based
    * fatal channel as the wedge ladder's final rung — the app rebuilds).
@@ -3189,7 +3225,7 @@ export class MseMediaSource implements MediaSourceLike {
    * any callback runs, so throwing or re-entrant listeners cannot skip the
    * seek, double-jump, or re-emit the escalation.
    */
-  private checkGapJump(nowMs: number): void {
+  private checkGapJump(nowMs: number, recovery = false): boolean | void {
     const generation = this.bufferGen;
     // Landing cancellation FIRST — before the episode fallback can transfer
     // any landing-owned evidence. Pause / element-error / withdrawn intent
@@ -3394,17 +3430,30 @@ export class MseMediaSource implements MediaSourceLike {
     if (c === null || c.kind !== kind || Math.abs(c.curEnd - curEnd!) > tol || Math.abs(c.nextStart - nextStart!) > tol) {
       this.gapCandidate = {
         curEnd: curEnd!, nextStart: nextStart!, armedAtMs: nowMs, kind,
-        wideWarned: false, spent: false,
+        wideWarned: false, spent: false, floors: new Map(this.committedGroupFloor),
       };
       return;
     }
-    if (c.spent) return;
+    if (c.spent && !recovery) return;
 
     // Unjumpable width: warn once; escalate once if it persists.
     // Strictly the advertised bound; 1e-9 guards float subtraction noise
     // only — the 10ms identity tolerance must never widen the policy.
     const wide = holeSec > MseMediaSource.GAP_JUMP_MAX_HOLE_SEC + 1e-9;
-    if (wide && !this.switchRecoveryCovers(curEnd!, nextStart!)) {
+    if (recovery) {
+      const receiving = (['video', 'audio'] as const).some(role => this.currentReceivingGroups(role).some(group => {
+        const floor = c.floors.get(`${role}:${group.trackIdentity}`);
+        return floor === undefined || group.groupId <= floor;
+      }));
+      const landing = nextStart! + Math.min(0.01, ((nextEnd ?? nextStart!) - nextStart!) / 2);
+      const covered = [this.videoBuffer, ...(this.audioBuffer ? [this.audioBuffer] : [])].every(buffer =>
+        this.nativeRanges(buffer)?.some(([start, end]) => start <= landing && landing < end));
+      if (receiving || !covered || this.switchRecovery || this.hasPendingNativeWork()
+          || this.destroyed || generation !== this.bufferGen || this.gapCandidate !== c
+          || !this.playbackIntent || v.paused || v.seeking || v.error !== null
+          || this.seekResource && !this.seekResource.released) return;
+    }
+    if (wide && !recovery && !this.switchRecoveryCovers(curEnd!, nextStart!)) {
       if (!c.wideWarned) {
         c.wideWarned = true;
         this.logWarn(
@@ -3419,10 +3468,13 @@ export class MseMediaSource implements MediaSourceLike {
           + `t=${ct.toFixed(2)}s — MediaSource rebuild required`,
         );
         err.name = 'MediaGapUnrecoverableError';
+        this.recoverableGapError = err;
         try {
           this.onError?.(err);
         } catch {
           // Listener bugs must not corrupt adapter state.
+        } finally {
+          this.recoverableGapError = null;
         }
       }
       return;
@@ -3509,6 +3561,7 @@ export class MseMediaSource implements MediaSourceLike {
       `[MSE] gap-jump: skipped ${holeSec.toFixed(2)}s hole `
       + `${info.from.toFixed(2)}s -> ${info.to.toFixed(2)}s after ${info.waitedMs.toFixed(0)}ms`,
     );
+    return true;
   }
 
   /**
@@ -4172,8 +4225,9 @@ export class MseMediaSource implements MediaSourceLike {
           timeline = new TimelineIndex();
           timelines.set(pendingTrack, { trackName: pendingTrackName, index: timeline });
         }
+        const slack = this.contiguousSlack(mediaType);
         for (const r of pending) {
-          timeline.insert(r.startTime, r.endTime);
+          timeline.insert(r.startTime, r.endTime, slack);
         }
         if (this.pendingGapSkip[mediaType] || this.lateAppendFloor[mediaType].has(pendingTrack)) {
           const end = timeline.extent?.end;

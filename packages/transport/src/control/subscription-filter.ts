@@ -229,8 +229,14 @@ function filterFromTypedLocationFilter(bytes: Uint8Array): SubscriptionFilter {
  * parameters) holding its LOCATION_FILTER. An omitted filter inherits the
  * subscription's filter.
  */
-export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: GroupOrder): Uint8Array {
+export function encodeFillParameters(filter?: SubscriptionFilter, groupOrder?: GroupOrder, subscriberPriority?: number): Uint8Array {
   const params = new Map<bigint, MessageParamValue[]>();
+  if (subscriberPriority !== undefined) {
+    if (!Number.isInteger(subscriberPriority) || subscriberPriority < 0 || subscriberPriority > 255) {
+      throw new RangeError('Fill Subscriber Priority must be an integer from 0 to 255');
+    }
+    params.set(0x20n, [{ kind: 'uint8', value: subscriberPriority }]);
+  }
   if (filter !== undefined) params.set(0x21n, [{ kind: 'locationFilter', value: encodeTypedLocationFilter(filter) }]);
   if (groupOrder !== undefined) {
     if (groupOrder !== 'ascending' && groupOrder !== 'descending') throw new RangeError('Invalid fill Group Order');
@@ -520,18 +526,20 @@ export interface SubscriptionWindow {
  * established with (SUBSCRIBE_OK's LARGEST_OBJECT; `undefined` for an empty
  * track). A subscriber sharing one Track Alias across several subscriptions to
  * the same track re-applies each window to attribute an object (draft-22 §3.1).
- * No filter selects the whole track.
+ * No filter selects the whole track. Omitted draftVersion uses draft22 semantics.
  */
 export function subscriptionWindow(
   filter: SubscriptionFilter | undefined,
   largest: { readonly group: bigint; readonly object: bigint } | undefined,
+  draftVersion: number = 22,
 ): SubscriptionWindow {
   const origin = { group: 0n, object: 0n };
   switch (filter?.type) {
     case undefined:
       return { start: origin };
     case 'NextGroupStart':
-      return { start: largest ? { group: largest.group < MAX_VI64 ? largest.group + 1n : MAX_VI64, object: 0n } : origin };
+      // d18 §5.1.2 selects the next Group; only d22 §9.20.9 saturates.
+      return { start: largest ? { group: isDraft22(draftVersion) && largest.group >= MAX_VI64 ? MAX_VI64 : largest.group + 1n, object: 0n } : origin };
     case 'LargestObject':
     case 'LatestObject':
       return { start: largest ? { group: largest.group, object: largest.object + 1n } : origin };

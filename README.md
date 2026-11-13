@@ -16,6 +16,29 @@ re-exports. Use the new names for new integrations; see
 
 ---
 
+## WebTransport scheduling
+
+The adapter owns `sendOrder`: control streams use **1024**, request streams
+use **512** (including draft-16 SUBSCRIBE_NAMESPACE), and subgroup, FETCH,
+Joining FETCH and draft-22 fill streams use **255 − accepted subscriber priority**.
+Assignments happen before the first byte, only when `sendOrder` is present
+(including inherited properties), and replace any provider-assigned value.
+Probe or setter failures are advisory; `sendGroup` is untouched.
+`onSchedulingWarning` reports the first failed hint per stream.
+Accepted priority changes re-rank open media streams, including pending FINs,
+before the acknowledgement is written. Refused updates leave ranks unchanged.
+
+A fill's `FillOptions.subscriberPriority` overrides inheritance for that fill only.
+An omitted value is frozen at SUBSCRIBE_OK for an initial fill, or at acceptance
+of its carrying update, including that update's priority even if its ACK is deferred.
+Later subscription updates never re-rank the fill or retain its override.
+
+This implements primary subscriber priority and the control/request bands from
+drafts 14/16/18 §7 and draft 22 §5.1. The SHOULD tie-breaks for publisher priority,
+group order (including draft-22 subscription-first when fill group order differs),
+and subgroup/object ID (including draft-22 fill-first) remain unimplemented.
+Datagram ordering and ordering within the request band are also unimplemented.
+
 ## Quick Start
 
 ### `@openmoq/playa` — Drop-in Player
@@ -388,6 +411,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 | `knownTracks` | object | — | Pre-known codec metadata for TTFF optimization |
 | `catalog` | `{tracks}` | — | Inject catalog externally, skip catalog subscription |
 | `targetLatencyMs` | number | — | Live catch-up target |
+| `liveJumpThresholdMs` | number | 3000 | Live LOC jumps toward received media after 1 s of excess above this threshold; 0 disables |
 | `maxCatchUpRate` | number | 1.0 | Max playback rate for catch-up |
 | `authority` | string | — | CLIENT_SETUP AUTHORITY for tenant-routed relays (interop override; spec prohibits it over WebTransport) |
 | `warmStartCurrentGroup` | boolean | false | Join live LOC/CMAF/LOCMAF tracks mid-group via Joining FETCH on drafts 14/16/18, or a fill on draft 22; non-fatal if refused |
@@ -638,6 +662,27 @@ instead of Google Chrome.
 ## Author
 
 Raymond Lucke and the Red5 Team
+
+## Publication heads and confirmed updates
+
+Publishers serving REQUEST_UPDATE on drafts 16, 18 and 22 must install
+`setLargestLocationProvider` for subscription requests and
+`setFetchLargestLocationProvider` for FETCH requests. Return the current track
+head as `{ group, object }`, or `null` only for a known-empty track. Bind each
+lookup to its exact live request; throw for unknown or retired sources. Advance
+the head before sending each Object. Prepare outgoing publication heads before
+writing PUBLISH so immediate peer updates can resolve the live request. A FETCH's finite end is not its track head.
+Missing, throwing or invalid providers refuse the update and terminate its
+subscription (UPDATE_FAILED) or FETCH. This also applies to draft-16/18 publishers
+that previously accepted updates without a provider.
+
+`requestUpdateConfirmed(id, { timeoutMs, ...options })` resolves after the matching
+REQUEST_OK has been applied and returns a private copy of its parameters.
+`RequestUpdateError` preserves a peer refusal. Other `RequestUpdateFailure`s say
+`not-sent` or `possibly-sent`; a timeout or abort after dispatch does not undo an
+update, and a late acknowledgement can still apply. Draft 14 has no confirmation.
+`IncomingPublish.largestLocation` reports a frozen receive-head snapshot; `closed`
+resolves with the final snapshot when the publication ends.
 
 ## License
 

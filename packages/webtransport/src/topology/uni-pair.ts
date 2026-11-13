@@ -1,3 +1,5 @@
+import { setSendOrder } from '../scheduling.js';
+import { finishPublisherTerminal, type PublisherTerminalOptions } from './publisher-terminal.js';
 /**
  * UniPairTopology — draft-18 control-stream topology.
  *
@@ -282,7 +284,9 @@ export class UniPairTopology {
     // control messages rather than FIN-ing after SETUP.
     let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
     try {
-      writer = (await transport.createUnidirectionalStream()).getWriter();
+      const writable = await transport.createUnidirectionalStream();
+      setSendOrder(writable, 1024, this.session);
+      writer = writable.getWriter();
       if (this.controlOpenInvalid(epoch)) {
         throw new Error('UniPairTopology: control stream opened after session termination');
       }
@@ -315,6 +319,12 @@ export class UniPairTopology {
     }
   }
 
+  /** Retire an unregistered allocation if shutdown crossed its open or hint. */
+  private checkRequestOpen(stream: WebTransportBidirectionalStream, epoch: number): void {
+    if (!this.controlOpenInvalid(epoch)) return;
+    void Promise.allSettled([stream.readable.cancel(), stream.writable.abort()]);
+    throw new Error('Request stream opened after session termination');
+  }
   private controlOpenInvalid(epoch: number): boolean {
     return epoch !== this.controlEpoch || this.session.state === SessionState.CLOSED;
   }
@@ -462,7 +472,10 @@ export class UniPairTopology {
       );
     }
     const requestId = message.requestId;
+    const epoch = this.controlEpoch;
     const stream = await transport.createBidirectionalStream();
+    setSendOrder(stream.writable, 512, this.session, requestId);
+    this.checkRequestOpen(stream, epoch);
     const ctx = new RequestStreamContext(stream, this.codec, message.type, requestId);
     this.contexts.set(requestId, ctx);
     // A peer-initiated REQUEST_UPDATE on this stream (§10.9, PUBLISH only) is
@@ -546,7 +559,7 @@ export class UniPairTopology {
       // stream it rode. The UNDERLYING request (SUBSCRIBE / PUBLISH) is therefore
       // gone — reclaim its context and notify the owner so its session state is
       // cleaned, else a later update would target an already-dead writer.
-      await this.terminateRequestContext(existingRequestId);
+      void this.terminateRequestContext(existingRequestId);
       throw err instanceof Error ? err : new Error(String(err));
     }
     return { requestId: message.requestId, response };
@@ -603,12 +616,14 @@ export class UniPairTopology {
    * first (e.g. PUBLISH_DONE on an outbound PUBLISH, draft-18 §10.11). FINs our
    * writable and STOP_SENDINGs the readable, then drops the context. No response
    * is expected for the final message. No-op if no such stream is open.
+   * @param terminal - Experimental termination context carrying a shared binding
+   * reason and reset hook. Optional; existing calls keep their behavior.
    */
-  async finishRequest(requestId: bigint, finalMessage?: ControlMessage): Promise<void> {
+  async finishRequest(requestId: bigint, finalMessage?: ControlMessage, terminal?: PublisherTerminalOptions): Promise<void> {
     const ctx = this.contexts.get(requestId);
     if (!ctx) return;
     this.contexts.delete(requestId);
-    await ctx.finishWith(finalMessage);
+    await ctx.finishWith(finalMessage, terminal);
   }
 
   // ── continuing request streams (SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS) ──
@@ -640,7 +655,10 @@ export class UniPairTopology {
       );
     }
     const requestId = message.requestId;
+    const epoch = this.controlEpoch;
     const stream = await transport.createBidirectionalStream();
+    setSendOrder(stream.writable, 512, this.session, requestId);
+    this.checkRequestOpen(stream, epoch);
     const ctx = new ContinuingRequestStreamContext(stream, this.codec, allowedContinuation, (m, kind) => handler(requestId, m, kind));
     this.continuingContexts.set(requestId, ctx);
     // Clean up the context once the stream ends (either outcome).
@@ -996,9 +1014,19 @@ class RequestStreamContext {
    * local PUBLISH_DONE on an outbound PUBLISH (§10.11). Resolves `closed` cleanly;
    * the read loop is suppressed from reporting the teardown as a failure.
    */
-  async finishWith(finalMessage?: ControlMessage): Promise<void> {
+  async finishWith(finalMessage?: ControlMessage, terminal?: PublisherTerminalOptions): Promise<void> {
     if (this.cancelled) return;
     this.cancelled = true; // suppress read-loop errors during teardown
+    if (terminal) {
+      try {
+        await finishPublisherTerminal(this.writer, this.reader,
+          () => finalMessage ? this.writer.write(this.codec.encode(finalMessage)) : Promise.resolve(), terminal);
+      } finally {
+        for (const d of this.queue.splice(0)) d.reject(terminal.reason);
+        this.closedDeferred.resolve();
+      }
+      return;
+    }
     if (finalMessage) {
       try { await this.writer.write(this.codec.encode(finalMessage)); } catch { /* already closed */ }
     }
@@ -1097,11 +1125,8 @@ class RequestStreamContext {
                 'PUBLISH_DONE without a preceding SUBSCRIBE_OK',
               );
             }
-            if (this.queue.length > 0) {
-              throw new ProtocolViolationError(
-                'PUBLISH_DONE while update responses are still outstanding',
-              );
-            }
+            // d18 §10.9.1 / d22 §9.5.1: DONE can cross unanswered updates.
+            for (const pending of this.queue.splice(0)) pending.reject(new RequestCancelledError(StreamResetCode18.CANCELLED));
             this.terminalSeen = true;
             await this.onPeerRequest?.(message);
             if (!this.writerFinished) {
