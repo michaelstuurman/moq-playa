@@ -17,6 +17,7 @@
  * @see draft-ietf-moq-loc-01 §4.1 (audio independently decodable)
  */
 
+import { LiveEdgeController } from './live-edge.js';
 import { MoqtPlayer, PlayerErrorCode, usesMsePath, buildCatalogSelection } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import { QlogTrace, varint } from '@openmoq/transport';
@@ -266,45 +267,67 @@ let mediaSourceRef: MseMediaSource | null = null;
 // whose keys are already licensed reuses that license.
 const drmSessionCache = new DrmSessionCache();
 
-// ?liveedge=<ms>: hold the MSE playhead this far behind the buffered end. The
-// player never catches up on the MSE path, so a slow start (an EME license
-// round trip, a late first append) otherwise stays as latency. A lag of more
-// than a second is jumped; a smaller one is closed at 5% faster playback.
-const liveEdgeMs = Number(params.get('liveedge') ?? '');
+// ?liveedge=auto or ?liveedge=<ms>: hold the MSE playhead close to the buffered
+// end. The player never catches up on the MSE path, so a slow start (an EME
+// license round trip, a late first append) otherwise stays as latency. With a
+// number the playhead stays that far behind; with "auto" the distance follows
+// the stream and goes as low as its arrivals allow (live-edge.ts).
+const liveEdgeParam = params.get('liveedge');
 let liveEdgeTimer: ReturnType<typeof setInterval> | undefined;
 function startLiveEdgeController(): void {
-    if (liveEdgeTimer !== undefined || !Number.isFinite(liveEdgeMs) || liveEdgeMs <= 0) return;
-    const target = liveEdgeMs / 1000;
-    const state = { jumps: 0, rate: 1 };
+    if (liveEdgeTimer !== undefined || liveEdgeParam === null) return;
+    const fixedMs = Number(liveEdgeParam);
+    if (liveEdgeParam !== 'auto' && !(Number.isFinite(fixedMs) && fixedMs > 0)) return;
+    const controller = new LiveEdgeController(liveEdgeParam === 'auto' ? undefined : fixedMs / 1000);
+    const state = { jumps: 0, rate: 1, targetMs: Math.round(controller.targetS * 1000) };
     (window as any).__liveEdge = state;
-    // A readout in the corner of the picture: the buffer ahead of the playhead,
-    // the encode-to-presentation delay when the stream carries capture times,
-    // the playback rate and the number of jumps.
+    // A readout in the corner of the picture: the buffer ahead of the playhead
+    // and its target, the encode-to-presentation delay when the stream carries
+    // capture times, the playback rate, and the jumps and stalls so far.
     const readout = document.createElement('div');
     readout.style.cssText = 'position:absolute;top:8px;left:8px;z-index:5;padding:3px 7px;border-radius:4px;'
         + 'background:rgba(0,0,0,.6);color:#fff;font:12px/1.4 ui-monospace,Menlo,monospace;pointer-events:none';
     playerWrap.appendChild(readout);
+    let watched: HTMLVideoElement | null = null;
+    let playing = false;
+    const onWaiting = (): void => {
+        // The first "waiting" of a start or a seek is not a stall.
+        if (playing && watched && !watched.seeking) controller.stalled(performance.now());
+    };
+    const onPlaying = (): void => { playing = true; };
+    let ticks = 0;
     liveEdgeTimer = setInterval(() => {
         const v = document.querySelector('video');
+        if (v !== watched) {
+            watched?.removeEventListener('waiting', onWaiting);
+            watched?.removeEventListener('playing', onPlaying);
+            watched = v;
+            playing = false;
+            v?.addEventListener('waiting', onWaiting);
+            v?.addEventListener('playing', onPlaying);
+        }
         if (!v || !v.buffered.length) { readout.textContent = 'buffer --'; return; }
         const end = v.buffered.end(v.buffered.length - 1);
         const ahead = end - v.currentTime;
-        const stats = player?.stats;
-        const shown = (stats as any)?.videoPresentationObservation?.encodeToPresentationMs;
-        readout.textContent = `buffer ${Math.round(ahead * 1000)} ms`
-            + (typeof shown === 'number' ? ` \u00b7 delay ${Math.round(shown)} ms` : '')
-            + ` \u00b7 ${v.playbackRate.toFixed(2)}x \u00b7 jumps ${state.jumps}`
-            + (typeof (stats as any)?.stallCount === 'number' ? ` \u00b7 stalls ${(stats as any).stallCount}` : '');
-        if (v.paused || v.seeking || v.readyState < 3) return;
-        if (ahead > target + 1.0) {
-            v.currentTime = end - target;
-            state.jumps++;
-            return;
+        if (!(v.paused || v.seeking || v.readyState < 3)) {
+            const step = controller.step(performance.now(), ahead);
+            if (step.jumpTo !== undefined) {
+                v.currentTime = end - step.jumpTo;
+                state.jumps++;
+            }
+            if (v.playbackRate !== step.rate) v.playbackRate = step.rate;
+            state.rate = step.rate;
+            state.targetMs = Math.round(controller.targetS * 1000);
         }
-        const rate = ahead > target + 0.1 ? 1.05 : ahead < target - 0.1 ? 0.97 : 1.0;
-        if (v.playbackRate !== rate) v.playbackRate = rate;
-        state.rate = rate;
-    }, 250);
+        if (ticks++ % 5 !== 0) return;
+        const stats = player?.stats as any;
+        const shown = stats?.videoPresentationObservation?.encodeToPresentationMs;
+        readout.textContent = `buffer ${Math.round(ahead * 1000)} ms`
+            + ` (${controller.auto ? 'auto ' : ''}${state.targetMs})`
+            + (typeof shown === 'number' ? ` · delay ${Math.round(shown)} ms` : '')
+            + ` · ${v.playbackRate.toFixed(2)}x · jumps ${state.jumps}`
+            + (typeof stats?.stallCount === 'number' ? ` · stalls ${stats.stallCount}` : '');
+    }, 50);
 }
 /**
  * Two-source latch for the joined startup summary (diagnostics only).
