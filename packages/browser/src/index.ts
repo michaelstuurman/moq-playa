@@ -17,7 +17,7 @@ export { AudioAlignedClock } from './audio-aligned-clock.js';
 export { CanvasRenderer } from './canvas-renderer.js';
 export { DeferredAudioOutput } from './deferred-audio-output.js';
 export { WebAudioOutput } from './webaudio-output.js';
-export { MseMediaSource } from './mse-adapter.js';
+export { MseMediaSource, drmAccessConfigurations } from './mse-adapter.js';
 export { DrmSessionCache } from './drm-session-cache.js';
 export type { DrmSessionCacheOptions } from './drm-session-cache.js';
 export type { MseMediaSourceOptions, MseAppendQueueLease, DrmConfig, MseImplementation, MseImplementationPreference, MseAttachment, MseAttachmentPreference, PlayheadWedgeInfo, GapJumpInfo, MseSeekOutcome, MseStartupSuccess, MseStartupRetriable, MseStartupReport } from './mse-adapter.js';

@@ -32,6 +32,8 @@ import {
     CanvasRenderer,
     WebAudioOutput,
     MseMediaSource,
+    drmAccessConfigurations,
+    type DrmConfig,
     type MseStartupReport,
     type CmafStartupGeometry,
     CmafAssembler,
@@ -1346,6 +1348,8 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     // build. Production is always `shared`.
     const epochMode = pickParam('epoch', ['shared', 'legacy'] as const, 'shared');
     const mseDebug = params.get('msedebug') === '1';
+    // Once per page: FairPlay fetches the certificate and probes the key system.
+    const drmConfig = await (drmChoice ??= chooseDrm());
     startupSummaryEnabled = mseDebug;
 
     // FETCH-catalog mode: pre-fetch + reuse adapter so the player skips
@@ -1404,12 +1408,11 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
             // ?gapjump=<ms> overrides the buffered-hole gap-jump wait
             // (0 disables) for A/B against hole-carrying streams.
             const gapJumpParam = params.get('gapjump');
-            const licenseUrl = msfLink?.licenseUrl ?? params.get('license');
             const ms: MseMediaSource = new MseMediaSource(videoEl, {
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
-                ...(licenseUrl ? { drmConfig: { licenseUrl, sessionCache: drmSessionCache } } : {}),
+                ...(drmConfig ? { drmConfig: { ...drmConfig, sessionCache: drmSessionCache } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
@@ -1686,4 +1689,44 @@ function buildTrackSelector(p: MoqtPlayer | null): void {
             });
         },
     }, !p || selectionBusy() || p.state === 'error' || p.state === 'ended');
+}
+
+let drmChoice: Promise<DrmConfig | undefined> | undefined;
+
+/**
+ * The DRM to use: `license` (Widevine license URL), and for Safari `fairplay`
+ * (FairPlay license URL: SPC in, CKC out) with `fpscert` (the FPS certificate
+ * URL), from the MSF fragment or else the query. FairPlay is used when given
+ * and the browser has it; otherwise Widevine.
+ */
+async function chooseDrm(): Promise<DrmConfig | undefined> {
+    const widevine = msfLink?.licenseUrl ?? params.get('license');
+    const fairplay = msfLink?.fairplayUrl ?? params.get('fairplay');
+    const fpsCert = msfLink?.fpsCertUrl ?? params.get('fpscert');
+    if (fairplay && fpsCert && await hasKeySystem('com.apple.fps')) {
+        try {
+            const response = await fetch(fpsCert);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const serverCertificate = new Uint8Array(await response.arrayBuffer());
+            log('[DRM] FairPlay');
+            return { licenseUrl: fairplay, keySystem: 'com.apple.fps', serverCertificate };
+        } catch (err) {
+            log(`[DRM] FairPlay certificate unavailable (${String(err)})`);
+        }
+    }
+    if (widevine) {
+        log('[DRM] Widevine');
+        return { licenseUrl: widevine };
+    }
+    return undefined;
+}
+
+async function hasKeySystem(keySystem: string): Promise<boolean> {
+    if (!navigator.requestMediaKeySystemAccess) return false;
+    try {
+        await navigator.requestMediaKeySystemAccess(keySystem, drmAccessConfigurations(keySystem));
+        return true;
+    } catch {
+        return false;
+    }
 }

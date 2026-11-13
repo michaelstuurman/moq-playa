@@ -20,7 +20,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { format } from 'node:util';
-import { MseMediaSource } from './mse-adapter.js';
+import { MseMediaSource, drmAccessConfigurations } from './mse-adapter.js';
 import { CmafAssembler } from './cmaf-assembler.js';
 import { DrmSessionCache, initDataKeyIds } from './drm-session-cache.js';
 import type { DrmConfig, MseStartupReport, MseMediaSourceOptions } from './mse-adapter.js';
@@ -5528,4 +5528,20 @@ describe('MseMediaSource — playback rate', () => {
         adapter.setPlaybackRate(1); expect(video.playbackRate).toBe(1); expect(video.preservesPitch).toBe(false);
     } finally { adapter.destroy(); }
 });
+});
+
+describe('drmAccessConfigurations', () => {
+    it('asks FairPlay for sinf init data and plain container types', () => {
+        const config = drmAccessConfigurations('com.apple.fps')[0]!;
+        expect(config.initDataTypes).toEqual(['sinf']);
+        expect(config.videoCapabilities).toEqual([{ contentType: 'video/mp4', robustness: '' }]);
+        expect(config.audioCapabilities).toEqual([{ contentType: 'audio/mp4', robustness: '' }]);
+        expect(drmAccessConfigurations('com.apple.fps.1_0')[0]!.initDataTypes).toEqual(['sinf']);
+    });
+
+    it('asks other key systems for cenc init data', () => {
+        for (const keySystem of ['com.widevine.alpha', 'org.w3.clearkey', 'com.apple.fpsx']) {
+            expect(drmAccessConfigurations(keySystem)[0]!.initDataTypes).toEqual(['cenc']);
+        }
+    });
 });

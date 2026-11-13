@@ -31,6 +31,10 @@ export interface PlayerMsfLink {
     readonly authorization?: PlayerAuthorization;
     /** DRM license URL from the page's own `license` fragment parameter; replaces `?license=`. */
     readonly licenseUrl?: string;
+    /** FairPlay license URL (`fairplay` fragment parameter); replaces `?fairplay=`. */
+    readonly fairplayUrl?: string;
+    /** FairPlay certificate URL (`fpscert` fragment parameter); replaces `?fpscert=`. */
+    readonly fpsCertUrl?: string;
     /** Parts of the URL this page does not act on. Safe to log: names only, never values. */
     readonly notes: readonly string[];
 }
@@ -40,9 +44,10 @@ export interface PlayerMsfLink {
  * none (empty, or not beginning with `msf:` or `moqt:`), in which case the
  * page's query parameters apply unchanged.
  *
- * `license` is NOT an MSF parameter. It is this page's own use of a
- * non-reserved name, so that a license URL carrying its own token can stay out
- * of the query string as well. Its value is percent-decoded.
+ * `license`, `fairplay` and `fpscert` are NOT MSF parameters. They are this
+ * page's own use of non-reserved names, so that a license URL carrying its own
+ * token can stay out of the query string as well. Their values are
+ * percent-decoded.
  *
  * The `c4m` token is sent as the CAT4MOQ token type unless `?authProfile=moqx-compat`
  * selects the type current moqx relays expect. The profile is not a secret and
@@ -82,14 +87,17 @@ export function readMsfLink(hash: string, search: string): PlayerMsfLink | undef
     if (fragment.mediatimeRanges.length > 0) notes.push('mediatime-range is not supported by this page and is ignored');
     if (fragment.locationRanges.length > 0) notes.push('location-range is not supported by this page and is ignored');
 
-    let licenseUrl: string | undefined;
+    const urls = new Map<'license' | 'fairplay' | 'fpscert', string>();
     let unknown = 0;
     for (const { name, value } of fragment.parameters) {
-        if (name !== 'license') { unknown++; continue; }
-        if (licenseUrl !== undefined) throw new Error('MSF URL repeats the license parameter');
-        if (query.get('license')) conflict('license');
-        licenseUrl = decodeLicenseUrl(value);
+        if (name !== 'license' && name !== 'fairplay' && name !== 'fpscert') { unknown++; continue; }
+        if (urls.has(name)) throw new Error(`MSF URL repeats the ${name} parameter`);
+        if (query.get(name)) conflict(name);
+        urls.set(name, decodeLicenseUrl(value, name));
     }
+    const licenseUrl = urls.get('license');
+    const fairplayUrl = urls.get('fairplay');
+    const fpsCertUrl = urls.get('fpscert');
     if (unknown > 0) notes.push(`${unknown} unrecognized parameter${unknown > 1 ? 's are' : ' is'} ignored`);
 
     let authorization: PlayerAuthorization | undefined;
@@ -105,15 +113,17 @@ export function readMsfLink(hash: string, search: string): PlayerMsfLink | undef
         ...(relayUrl !== undefined ? { relayUrl } : {}),
         ...(authorization ? { authorization } : {}),
         ...(licenseUrl !== undefined ? { licenseUrl } : {}),
+        ...(fairplayUrl !== undefined ? { fairplayUrl } : {}),
+        ...(fpsCertUrl !== undefined ? { fpsCertUrl } : {}),
         notes,
     };
 }
 
-function decodeLicenseUrl(value: string): string {
+function decodeLicenseUrl(value: string, name: string): string {
     try {
         const decoded = decodeURIComponent(value);
         const url = new URL(decoded);
         if ((url.protocol === 'https:' || url.protocol === 'http:') && !url.hash) return decoded;
     } catch { /* refused below, without the value */ }
-    throw new Error('MSF URL license parameter must be a percent-encoded http(s) URL without a fragment');
+    throw new Error(`MSF URL ${name} parameter must be a percent-encoded http(s) URL without a fragment`);
 }
