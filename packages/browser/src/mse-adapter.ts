@@ -1495,6 +1495,7 @@ export class MseMediaSource implements MediaSourceLike {
               .map((b: number) => b.toString(16).padStart(2, '0')).join(' ');
             this.videoInitSummary = `codec=${config.video.codec} bytes=${videoInit.byteLength} boxes=[${boxes}] head=[${head}]`;
             this.logDebug('[MSE] Video init: %s', this.videoInitSummary);
+            if (this.drmConfig) this.logDebug('[DRM] video protection: %s', describeProtection(videoInit));
             // Cache trex defaults for the timeline-owned append path.
             // filterInitSegment produces a single-track init, so any
             // trex entry found is our track's.
@@ -1521,6 +1522,7 @@ export class MseMediaSource implements MediaSourceLike {
               .map((b: number) => b.toString(16).padStart(2, '0')).join(' ');
             this.audioInitSummary = `codec=${config.audio.codec} bytes=${audioInit.byteLength} boxes=[${boxes}] head=[${head}]`;
             this.logDebug('[MSE] Audio init: %s', this.audioInitSummary);
+            if (this.drmConfig) this.logDebug('[DRM] audio protection: %s', describeProtection(audioInit));
             const trexMap = readTrexDefaults(audioInit);
             const first = trexMap.values().next();
             if (!first.done) this.audioTrex = first.value;
@@ -2304,8 +2306,12 @@ export class MseMediaSource implements MediaSourceLike {
         // shared only through the cache, never through the element state.
         keys = await cache.mediaKeys(drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate), async () => {
           const access = await navigator.requestMediaKeySystemAccess(keySystem, drmAccessConfigurations(keySystem));
+          if (this.debug) this.logDebug('[DRM] access %s: %s', keySystem, describeAccess(access));
           const created = await access.createMediaKeys();
-          if (drm.serverCertificate) await created.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+          if (drm.serverCertificate) {
+            const accepted = await created.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+            this.logDebug('[DRM] server certificate (%d bytes) accepted=%s', drm.serverCertificate.byteLength, accepted);
+          }
           return created;
         });
         if (this.destroyed) return;
@@ -2320,10 +2326,12 @@ export class MseMediaSource implements MediaSourceLike {
         }
         const access = await navigator.requestMediaKeySystemAccess(keySystem, drmAccessConfigurations(keySystem));
         if (this.destroyed) return;
+        if (this.debug) this.logDebug('[DRM] access %s: %s', keySystem, describeAccess(access));
         keys = await access.createMediaKeys();
         if (this.destroyed) return;
         if (drm.serverCertificate) {
-          await keys.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+          const accepted = await keys.setServerCertificate(new Uint8Array(drm.serverCertificate).buffer);
+          this.logDebug('[DRM] server certificate (%d bytes) accepted=%s', drm.serverCertificate.byteLength, accepted);
           if (this.destroyed) return;
         }
       }
@@ -2336,6 +2344,7 @@ export class MseMediaSource implements MediaSourceLike {
         state.keySystem = keySystem;
         state.certificate = drm.serverCertificate;
         state.cached = cache !== null;
+        this.logDebug('[DRM] MediaKeys attached (%s)', keySystem);
         if (!this.destroyed) this.mediaKeys = keys;
       });
       // A failed attachment must not poison the next owner's queue. Permission
@@ -2353,6 +2362,7 @@ export class MseMediaSource implements MediaSourceLike {
    * and fetches the license from the configured server.
    */
   private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
+    this.logDebug('[DRM] encrypted: initDataType=%s bytes=%d', event.initDataType, event.initData?.byteLength ?? -1);
     if (this.destroyed || !this.drmConfig || !event.initData) return;
     const initData = new Uint8Array(event.initData).slice();
     let session: MediaKeySession | null = null;
@@ -2379,7 +2389,9 @@ export class MseMediaSource implements MediaSourceLike {
         cache.track(partition, created, event.initDataType, initData, revoke)) : null;
       this.holdKeySession(session, event.initDataType, initData, retained);
       await session.generateRequest(event.initDataType, initData);
+      this.logDebug('[DRM] generateRequest(%s) done', event.initDataType);
     } catch (err) {
+      this.logWarn('[DRM] session failed: %s', String(err));
       if (session && !this.keySessions.has(session)) return;
       if (session) this.retireKeySession(session);
       this.reportDrmError('session', err);
@@ -2393,6 +2405,7 @@ export class MseMediaSource implements MediaSourceLike {
   private handleKeyMessage = async (event: MediaKeyMessageEvent): Promise<void> => {
     const session = event.target as MediaKeySession;
     const state = this.keySessions.get(session);
+    this.logDebug('[DRM] message: type=%s bytes=%d', event.messageType, event.message?.byteLength ?? -1);
     if (!this.drmConfig || !state || this.destroyed) return;
     const live = (): boolean => !this.destroyed && this.keySessions.get(session) === state;
     try {
@@ -2402,12 +2415,14 @@ export class MseMediaSource implements MediaSourceLike {
         signal: state.abort.signal,
       });
       if (!live()) return;
+      this.logDebug('[DRM] license POST: %d', response.status);
       if (!response.ok) {
         throw new Error(`License server returned ${response.status} ${response.statusText}`);
       }
       const license = await response.arrayBuffer();
       if (!live()) return;
       await session.update(new Uint8Array(license));
+      this.logDebug('[DRM] update(%d bytes) done', license.byteLength);
     } catch (err) {
       if (!live()) return;
       this.retireKeySession(session);
@@ -2420,6 +2435,13 @@ export class MseMediaSource implements MediaSourceLike {
     const state: DrmSessionState = { initDataType, initData, abort: new AbortController(), cached };
     this.keySessions.set(session, state);
     session.addEventListener('message', this.handleKeyMessage);
+    if (this.debug) {
+      session.addEventListener('keystatuseschange', () => {
+        const statuses: string[] = [];
+        session.keyStatuses.forEach((status) => statuses.push(status));
+        this.logDebug('[DRM] key statuses: %s', statuses.join(',') || 'none');
+      });
+    }
     void session.closed.then(() => {
       if (this.keySessions.get(session) === state) this.retireKeySession(session, false);
     });
@@ -2472,6 +2494,7 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   private reportDrmError(stage: string, err: unknown): void {
+    this.logWarn('[DRM] %s error: %s', stage, String(err));
     if (this.destroyed) return;
     const error = err instanceof Error ? err : new Error(`DRM ${stage} failed: ${String(err)}`);
     try { this.onError?.(error); } catch { /* Do not reject an asynchronous event handler. */ }
@@ -4522,4 +4545,51 @@ export class MseMediaSource implements MediaSourceLike {
       ),
     );
   };
+}
+
+/**
+ * The protection boxes of an init segment, for diagnostics: the sample entry
+ * type, `frma`, `schm` and `tenc` (version, pattern, IV sizes, KID). No key
+ * material: an init segment holds none.
+ */
+export function describeProtection(init: Uint8Array): string {
+  const find = (type: string, from = 0): number => {
+    const t = [...type].map((c) => c.charCodeAt(0));
+    for (let i = from + 4; i + 4 <= init.byteLength; i++) {
+      if (init[i] === t[0] && init[i + 1] === t[1] && init[i + 2] === t[2] && init[i + 3] === t[3]) return i - 4;
+    }
+    return -1;
+  };
+  const fourcc = (at: number): string => String.fromCharCode(...init.slice(at, at + 4));
+  const hex = (from: number, to: number): string =>
+    Array.from(init.slice(from, to)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const stsd = find('stsd');
+  const entry = stsd >= 0 && stsd + 24 <= init.byteLength ? fourcc(stsd + 20) : '?';
+  const sinf = find('sinf');
+  if (sinf < 0) return `entry=${entry} sinf=none pssh=${find('pssh') >= 0 ? 'yes' : 'no'}`;
+  const parts = [`entry=${entry}`];
+  const frma = find('frma', sinf);
+  if (frma >= 0) parts.push(`frma=${fourcc(frma + 8)}`);
+  const schm = find('schm', sinf);
+  if (schm >= 0) parts.push(`schm=${fourcc(schm + 12)} v${(init[schm + 16]! << 8 | init[schm + 17]!) >>> 0}.${init[schm + 18]! << 8 | init[schm + 19]!}`);
+  const tenc = find('tenc', sinf);
+  if (tenc >= 0) {
+    const version = init[tenc + 8]!;
+    const pattern = init[tenc + 13]!;
+    const isProtected = init[tenc + 14]!;
+    const ivSize = init[tenc + 15]!;
+    parts.push(`tenc v${version} crypt:skip=${pattern >> 4}:${pattern & 15} protected=${isProtected} ivsize=${ivSize}`
+      + ` kid=${hex(tenc + 16, tenc + 32)}`);
+    if (isProtected && ivSize === 0) parts.push(`constiv=${init[tenc + 32]} bytes`);
+  }
+  parts.push(`pssh=${find('pssh') >= 0 ? 'yes' : 'no'}`);
+  return parts.join(' ');
+}
+
+function describeAccess(access: MediaKeySystemAccess): string {
+  try {
+    return JSON.stringify(access.getConfiguration());
+  } catch (err) {
+    return `(no configuration: ${String(err)})`;
+  }
 }
