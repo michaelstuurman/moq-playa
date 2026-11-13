@@ -1348,8 +1348,17 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     // build. Production is always `shared`.
     const epochMode = pickParam('epoch', ['shared', 'legacy'] as const, 'shared');
     const mseDebug = params.get('msedebug') === '1';
-    // Once per page: FairPlay fetches the certificate and probes the key system.
-    const drmConfig = await (drmChoice ??= chooseDrm());
+    // DRM: `license` (Widevine), and for Safari `fairplay` + `fpscert`, from
+    // the MSF fragment or else the query. FairPlay fetches the certificate and
+    // probes the key system, once per page; without it the choice stays
+    // synchronous, so startup is unchanged.
+    const widevineUrl = msfLink?.licenseUrl ?? params.get('license');
+    const widevineDrm: DrmConfig | undefined = widevineUrl ? { licenseUrl: widevineUrl } : undefined;
+    const fairplayUrl = msfLink?.fairplayUrl ?? params.get('fairplay');
+    const fpsCertUrl = msfLink?.fpsCertUrl ?? params.get('fpscert');
+    const drmConfig = fairplayUrl && fpsCertUrl
+        ? await (drmChoice ??= chooseFairplay(fairplayUrl, fpsCertUrl, widevineDrm))
+        : widevineDrm;
     startupSummaryEnabled = mseDebug;
 
     // FETCH-catalog mode: pre-fetch + reuse adapter so the player skips
@@ -1694,31 +1703,23 @@ function buildTrackSelector(p: MoqtPlayer | null): void {
 let drmChoice: Promise<DrmConfig | undefined> | undefined;
 
 /**
- * The DRM to use: `license` (Widevine license URL), and for Safari `fairplay`
- * (FairPlay license URL: SPC in, CKC out) with `fpscert` (the FPS certificate
- * URL), from the MSF fragment or else the query. FairPlay is used when given
- * and the browser has it; otherwise Widevine.
+ * FairPlay (license URL: SPC in, CKC out) when the browser has it and the
+ * certificate loads; otherwise `fallback` (Widevine).
  */
-async function chooseDrm(): Promise<DrmConfig | undefined> {
-    const widevine = msfLink?.licenseUrl ?? params.get('license');
-    const fairplay = msfLink?.fairplayUrl ?? params.get('fairplay');
-    const fpsCert = msfLink?.fpsCertUrl ?? params.get('fpscert');
-    if (fairplay && fpsCert && await hasKeySystem('com.apple.fps')) {
-        try {
-            const response = await fetch(fpsCert);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const serverCertificate = new Uint8Array(await response.arrayBuffer());
-            log('[DRM] FairPlay');
-            return { licenseUrl: fairplay, keySystem: 'com.apple.fps', serverCertificate };
-        } catch (err) {
-            log(`[DRM] FairPlay certificate unavailable (${String(err)})`);
-        }
+async function chooseFairplay(
+    licenseUrl: string, certificateUrl: string, fallback: DrmConfig | undefined,
+): Promise<DrmConfig | undefined> {
+    if (!await hasKeySystem('com.apple.fps')) return fallback;
+    try {
+        const response = await fetch(certificateUrl);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const serverCertificate = new Uint8Array(await response.arrayBuffer());
+        log('[DRM] FairPlay');
+        return { licenseUrl, keySystem: 'com.apple.fps', serverCertificate };
+    } catch (err) {
+        log(`[DRM] FairPlay certificate unavailable (${String(err)})`);
+        return fallback;
     }
-    if (widevine) {
-        log('[DRM] Widevine');
-        return { licenseUrl: widevine };
-    }
-    return undefined;
 }
 
 async function hasKeySystem(keySystem: string): Promise<boolean> {
