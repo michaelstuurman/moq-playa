@@ -287,8 +287,12 @@ interface DrmSessionState {
  * FairPlay (`com.apple.fps`, Safari) signals keys with `sinf` init data, not
  * `cenc` pssh boxes, and Safari matches plain container types.
  */
+function isFairplay(keySystem: string | undefined): boolean {
+  return keySystem === 'com.apple.fps' || keySystem?.startsWith('com.apple.fps.') === true;
+}
+
 export function drmAccessConfigurations(keySystem: string): MediaKeySystemConfiguration[] {
-  if (keySystem === 'com.apple.fps' || keySystem.startsWith('com.apple.fps.')) {
+  if (isFairplay(keySystem)) {
     return [{
       initDataTypes: ['sinf'],
       videoCapabilities: [{ contentType: 'video/mp4', robustness: '' }],
@@ -1118,6 +1122,8 @@ export class MseMediaSource implements MediaSourceLike {
       }
       const elementState = state;
       this.video.addEventListener('encrypted', this.handleEncrypted);
+      this.video.addEventListener('waitingforkey', this.handleWaitingForKey);
+      this.video.addEventListener('webkitneedkey', this.handleWaitingForKey);
       this.mediaKeysReady = Promise.resolve().then(() => this.setupMediaKeys(config, elementState));
     }
   }
@@ -1545,11 +1551,24 @@ export class MseMediaSource implements MediaSourceLike {
       }
     };
 
-    if (this.ms.readyState === 'open') {
-      doInit();
+    const start = () => {
+      if (this.destroyed || this.ms !== source || this.bufferGen !== generation || !this.initialized) return;
+      if (this.ms.readyState === 'open') {
+        doInit();
+      } else {
+        this.sourceOpenListener = doInit;
+        this.ms.addEventListener('sourceopen', doInit, { once: true });
+      }
+    };
+    // FairPlay: Safari reports the init segment's key need ('encrypted') only
+    // with MediaKeys already on the element, so the init waits for them.
+    // The player feeds media only after onAttached, as with sourceopen.
+    const keys = this.drmConfig && isFairplay(this.drmConfig.keySystem) ? this.mediaKeysReady : null;
+    if (keys) {
+      this.logDebug('[DRM] init waits for MediaKeys');
+      void keys.then(start);
     } else {
-      this.sourceOpenListener = doInit;
-      this.ms.addEventListener('sourceopen', doInit, { once: true });
+      start();
     }
     return true;
   }
@@ -2265,6 +2284,8 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
     this.video.removeEventListener('encrypted', this.handleEncrypted);
+    this.video.removeEventListener('waitingforkey', this.handleWaitingForKey);
+    this.video.removeEventListener('webkitneedkey', this.handleWaitingForKey);
     for (const session of this.keySessions.keys()) this.releaseKeySession(session);
     this.mediaKeys = null;
     // Leave the attachment available for a compatible reconnect. Without a
@@ -2361,6 +2382,11 @@ export class MseMediaSource implements MediaSourceLike {
    * browser encounters PSSH in an init segment. Creates a key session
    * and fetches the license from the configured server.
    */
+  /** Diagnostics only: the element waits for a key it was never asked for. */
+  private handleWaitingForKey = (event: Event): void => {
+    this.logDebug('[DRM] %s (mediaKeys=%s)', event.type, this.video.mediaKeys ? 'set' : 'none');
+  };
+
   private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
     this.logDebug('[DRM] encrypted: initDataType=%s bytes=%d', event.initDataType, event.initData?.byteLength ?? -1);
     if (this.destroyed || !this.drmConfig || !event.initData) return;
