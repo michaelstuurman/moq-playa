@@ -1400,6 +1400,9 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         ...(prefetched ? { catalog: prefetched.catalog, connection: prefetched.connection } : {}),
         ...(lateMs ? { lateFrameThresholdMs: lateMs } : {}),
         ...(gapMs ? { gapTimeoutMs: gapMs } : {}),
+        // ?audio=off plays the video alone, for a browser that cannot take the
+        // stream's audio codec (Opus in MP4 on Safari's MSE).
+        ...(params.get('audio') === 'off' ? { disableAudio: true } : {}),
         ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
         createTransport: createWebTransport({ signal: transportAbort.signal,
             ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
