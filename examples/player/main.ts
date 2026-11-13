@@ -269,6 +269,19 @@ let mediaSourceRef: MseMediaSource | null = null;
 // whose keys are already licensed reuses that license.
 const drmSessionCache = new DrmSessionCache();
 
+// ?msedebug=1 also shows the adapter's [DRM] console lines in the on-page log,
+// for a device without a console (an iPhone). They hold no key material.
+if (params.get('msedebug') === '1') {
+    const consoleLog = console.log.bind(console);
+    console.log = (...args: unknown[]): void => {
+        consoleLog(...args);
+        if (typeof args[0] !== 'string' || !args[0].startsWith('[DRM]')) return;
+        let next = 1;
+        const text = args[0].replace(/%[sdo]/g, () => String(args[next++]));
+        log([text, ...args.slice(next).map(String)].join(' '));
+    };
+}
+
 // ?liveedge=auto or ?liveedge=<ms>: hold the MSE playhead close to the buffered
 // end. The player never catches up on the MSE path, so a slow start (an EME
 // license round trip, a late first append) otherwise stays as latency. With a
