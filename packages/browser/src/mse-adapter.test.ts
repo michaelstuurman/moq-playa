@@ -3871,6 +3871,33 @@ describe('MseMediaSource DRM lifecycle', () => {
         return { adapter, video, keys, access, requestAccess, sessions, encrypted, reconnect, message };
     }
 
+    it('FairPlay appends the init only once MediaKeys are on the element', async () => {
+        const access = deferred<void>();
+        const { adapter, video } = setup(Uint8Array.of(9), access.promise, { keySystem: 'com.apple.fps' });
+        const attached = vi.fn();
+        adapter.onAttached = attached;
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        currentMs.open();
+        await settle();
+        expect(currentMs.addSourceBufferCalls).toEqual([]);
+        expect(attached).not.toHaveBeenCalled();
+        access.resolve();
+        await settle();
+        expect(video.mediaKeys).not.toBeNull();
+        expect(currentMs.addSourceBufferCalls).toEqual(['video/mp4; codecs="avc1.42c01e"']);
+        expect(attached).toHaveBeenCalledOnce();
+    });
+
+    it('Widevine does not wait for MediaKeys before the init', async () => {
+        const access = deferred<void>();
+        const { adapter } = setup(undefined, access.promise);
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: makeInit(1, 100) } });
+        currentMs.open();
+        await settle();
+        expect(currentMs.addSourceBufferCalls).toEqual(['video/mp4; codecs="avc1.42c01e"']);
+        access.resolve();
+    });
+
     it('repeated identical initialization does not duplicate the request', async () => {
         const { encrypted, sessions } = setup();
         await encrypted(1);
