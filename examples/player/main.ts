@@ -289,12 +289,12 @@ function startLiveEdgeController(): void {
         if (!v || !v.buffered.length) { readout.textContent = 'buffer --'; return; }
         const end = v.buffered.end(v.buffered.length - 1);
         const ahead = end - v.currentTime;
-        const stats: PlayerStats | undefined = player ? ((player as any)._stats?.snapshot() ?? player.stats) : undefined;
+        const stats = player?.stats;
         const shown = (stats as any)?.videoPresentationObservation?.encodeToPresentationMs;
         readout.textContent = `buffer ${Math.round(ahead * 1000)} ms`
             + (typeof shown === 'number' ? ` \u00b7 delay ${Math.round(shown)} ms` : '')
             + ` \u00b7 ${v.playbackRate.toFixed(2)}x \u00b7 jumps ${state.jumps}`
-            + (stats ? ` \u00b7 stalls ${stats.stallCount}` : '');
+            + (typeof (stats as any)?.stallCount === 'number' ? ` \u00b7 stalls ${(stats as any).stallCount}` : '');
         if (v.paused || v.seeking || v.readyState < 3) return;
         if (ahead > target + 1.0) {
             v.currentTime = end - target;
