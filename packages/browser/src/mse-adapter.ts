@@ -835,6 +835,7 @@ export class MseMediaSource implements MediaSourceLike {
   // Attachment can outlive an adapter; serialize it across reconnects on the
   // same element. Sessions and license requests remain adapter-owned.
   private static readonly drmElements = new WeakMap<HTMLVideoElement, DrmElementState>();
+  private readonly loggedKeySessions = new WeakSet<MediaKeySession>();
 
   // ── Playhead-wedge watchdog state ──
   /** Watchdog cadence; detection threshold per escalation rung. */
@@ -2461,12 +2462,20 @@ export class MseMediaSource implements MediaSourceLike {
     const state: DrmSessionState = { initDataType, initData, abort: new AbortController(), cached };
     this.keySessions.set(session, state);
     session.addEventListener('message', this.handleKeyMessage);
-    if (this.debug) {
-      session.addEventListener('keystatuseschange', () => {
+    // Diagnostics: one listener per session and adapter (a cached session is
+    // held again on reuse), logging only a change, removed once destroyed.
+    if (this.debug && !this.loggedKeySessions.has(session)) {
+      this.loggedKeySessions.add(session);
+      let last = '';
+      const onStatuses = (): void => {
+        if (this.destroyed) { session.removeEventListener('keystatuseschange', onStatuses); return; }
         const statuses: string[] = [];
         session.keyStatuses.forEach((status) => statuses.push(status));
-        this.logDebug('[DRM] key statuses: %s', statuses.join(',') || 'none');
-      });
+        const now = statuses.join(',') || 'none';
+        if (now !== last) this.logDebug('[DRM] key statuses: %s', now);
+        last = now;
+      };
+      session.addEventListener('keystatuseschange', onStatuses);
     }
     void session.closed.then(() => {
       if (this.keySessions.get(session) === state) this.retireKeySession(session, false);
