@@ -296,13 +296,14 @@ function startLiveEdgeController(): void {
     const controller = new LiveEdgeController(liveEdgeParam === 'auto' ? undefined : fixedMs / 1000);
     const state = { jumps: 0, rate: 1, targetMs: Math.round(controller.targetS * 1000) };
     (window as any).__liveEdge = state;
-    // A readout in the corner of the picture: the buffer ahead of the playhead
-    // and its target, the encode-to-presentation delay when the stream carries
-    // capture times, the playback rate, and the jumps and stalls so far.
+    // ?stats=1 adds a readout in the corner of the picture: the buffer ahead of
+    // the playhead and its target, the encode-to-presentation delay when the
+    // stream carries capture times, the playback rate, and the jumps and stalls
+    // so far. Without it the element stays out of the page.
     const readout = document.createElement('div');
     readout.style.cssText = 'position:absolute;top:8px;left:8px;z-index:5;padding:3px 7px;border-radius:4px;'
         + 'background:rgba(0,0,0,.6);color:#fff;font:12px/1.4 ui-monospace,Menlo,monospace;pointer-events:none';
-    playerWrap.appendChild(readout);
+    if (params.get('stats') === '1') playerWrap.appendChild(readout);
     let watched: HTMLVideoElement | null = null;
     let playing = false;
     const onWaiting = (): void => {
