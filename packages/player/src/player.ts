@@ -236,6 +236,38 @@ interface PresentedFrameElement {
 const PRESENTED_FRAME_QUANTIZATION_US = 2n;
 const MAX_PRESENTATION_CANDIDATES = 64;
 
+/** Fail closed when an edit list makes raw sample PTS insufficient to date presentation. */
+function hasPresentationEdit(bytes: Uint8Array): boolean {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const path = [0x6d6f6f76, 0x7472616b, 0x65647473, 0x656c7374]; // moov/trak/edts/elst
+  const scan = (start: number, end: number, depth: number): boolean => {
+    for (let pos = start; pos < end;) {
+      if (end - pos < 8) return true;
+      let size = view.getUint32(pos), body = pos + 8;
+      const type = view.getUint32(pos + 4);
+      if (size === 1) {
+        if (end - pos < 16) return true;
+        const large = view.getBigUint64(pos + 8);
+        if (large > BigInt(end - pos)) return true;
+        size = Number(large); body += 8;
+      } else if (size === 0) size = end - pos;
+      if (size < body - pos || size > end - pos) return true;
+      if (type === path[depth]) {
+        if (depth < 3) { if (scan(body, pos + size, depth + 1)) return true; }
+        else {
+          if (pos + size - body < 8 || view.getUint8(body) > 1) return true;
+          const v1 = view.getUint8(body) === 1;
+          if (view.getUint32(body + 4) !== 0 && (pos + size - body < (v1 ? 28 : 20)
+              || (v1 ? view.getBigInt64(body + 16) !== 0n : view.getInt32(body + 12) !== 0))) return true;
+        }
+      }
+      pos += size;
+    }
+    return false;
+  };
+  return scan(0, bytes.length, 0);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -825,7 +857,7 @@ function createLocSeekQuality(fromTrackName: string, toTrackName: string, reason
 }
 export class MoqtPlayer {
   /** Player version (set at build time). */
-  static readonly version = '0.6.1';
+  static readonly version = '0.7.0';
 
   private readonly config: MoqtPlayerConfig & { readonly catalogTrackName: string };
   private readonly emitter = new TypedEmitter<PlayerEventMap>();
@@ -15097,6 +15129,9 @@ export class MoqtPlayer {
   /** Place an anchored Object's first sample exactly where the element will present it. */
   private noteVideoPresentationCandidate(encode: NonNullable<MoqtPlayer['videoEncodeRecord']>, receipt: CmafSourceReceipt | void,
     assembler: CmafAssemblerLike, source: MediaSourceLike): void {
+    // MSF-01 §7.1.1 dates the sample PTS; our placement does not model edit-list shifts.
+    const init = this.installedCmafInit.get('video');
+    if (init?.source === source && hasPresentationEdit(init.bytes)) return;
     const decode = receipt?.state === 'emitted' ? receipt.sourceDecodeTime : undefined;
     const element = source.mediaElement as Partial<PresentedFrameElement> | null | undefined;
     if (!decode || receipt?.state !== 'emitted' || !Number.isSafeInteger(decode.timescale) || decode.timescale <= 0
@@ -15107,9 +15142,8 @@ export class MoqtPlayer {
     const scale = BigInt(decode.timescale), us = receipt.sourcePresentationTimeUs;
     const ticks = (us * scale + 999_999n) / 1_000_000n;
     if (ticks * 1_000_000n / scale !== us) return;
-    // The anchor must name this sample: its declared PTS within its own millisecond unit.
-    const sourceMs = Number(ticks) * 1000 / decode.timescale;
-    if (!(Math.abs(sourceMs - encode.observation.mediaPtsMs) < 1)) return;
+    // MSF-01 §7.1.1: the entry MUST equal the first sample PTS floored to integral milliseconds.
+    if (!Number.isInteger(encode.observation.mediaPtsMs) || ticks * 1000n / scale !== BigInt(encode.observation.mediaPtsMs)) return;
     let placement: ReturnType<NonNullable<CmafAssemblerLike['capturePresentationPlacement']>> | undefined;
     let nativeOffset: number | undefined;
     try {

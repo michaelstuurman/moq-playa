@@ -1,7 +1,8 @@
 /** Exact declared encode anchors at presentation of the received Object's first sample. */
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
-import { videoInit, buildChunk, SYNC_FLAGS } from '../../locmaf/test-support/cmaf.js';
+import { videoInit, buildInit, buildChunk, SYNC_FLAGS, NON_SYNC_FLAGS } from '../../locmaf/test-support/cmaf.js';
+import { concat, fullBox, isoBox, u16, u32, u64 } from '../../locmaf/test-support/bytes.js';
 import { audioPeer, identity } from '../test-support/audio-selection.js';
 import { flush } from '../../webtransport/src/testkit/loopback.js';
 import { MoqtPlayer } from './player.js';
@@ -12,14 +13,14 @@ type Entries = Array<[number,[number,number],number]>;
 type Frame=(now:number,metadata:{mediaTime:number})=>void;
 beforeEach(()=>vi.useFakeTimers({toFake:['setInterval','clearInterval']}));
 afterEach(()=>{vi.restoreAllMocks();vi.useRealTimers();});
-async function fixture(options: {entries?: Entries; offset?:number; element?:boolean}={}) {
+async function fixture(options: {entries?: Entries; offset?:number; element?:boolean; init?:Uint8Array}={}) {
  const wire=audioPeer(18), errors:string[]=[], fetches:bigint[]=[], frames=new Map<number,Frame>();
  let wall=W+75, offset=options.offset??0, timelineObject=0n, handles=0, assembler:CmafAssembler|undefined;
  wire.server.onFetch=id=>{fetches.push(id);};
  const element={requestVideoFrameCallback(cb:Frame){frames.set(++handles,cb);return handles;},cancelVideoFrameCallback(h:number){frames.delete(h);}};
  const source:MediaSourceLike={attached:true,initialize:()=>true,appendChunk(){},
  getTimestampOffset:()=>offset,changeType:async()=>{},reset(){},endOfStream(){},destroy(){},mediaElement:options.element===false?null:element,onFirstFrame:null,onError:null,onStall:null};
- const catalog=new TextEncoder().encode(JSON.stringify({version:1,initDataList:[{id:'header',type:'inline',data:Buffer.from(videoInit()).toString('base64')}],tracks:[
+ const catalog=new TextEncoder().encode(JSON.stringify({version:1,initDataList:[{id:'header',type:'inline',data:Buffer.from(options.init ?? videoInit()).toString('base64')}],tracks:[
  {name:'video',namespace:namespace.join('/'),role:'video',packaging:'cmaf',codec:'avc1.640028',isLive:true,initRef:'header',bitrate:600000},
  {name:'timeline',namespace:namespace.join('/'),packaging:'mediatimeline',type:'mediatimeline',isLive:true,mimeType:'application/json',depends:['video']}]}));
  const player=new MoqtPlayer({url:'https://presented.invalid/moq',namespace,draftVersion:18,catalogBootstrap:'subscribe',reconnectAttempts:0,connectionTimeoutMs:5000,cmafBootstrapTimeoutMs:0,livenessTimeoutMs:0,disableAudio:true,autoQuality:false,selection:{videoTrack:{name:'video'}},
@@ -28,7 +29,7 @@ async function fixture(options: {entries?: Entries; offset?:number; element?:boo
  player.on('error',e=>errors.push(e.error.message));
  vi.spyOn(Date,'now').mockImplementation(()=>wall);
  const timeline=async(entries:Entries)=>wire.send(ref('timeline'),new TextEncoder().encode(JSON.stringify(entries)),0n,timelineObject++);
- const chunk=(pts=1000)=>buildChunk({trackId:1,bmdt:BigInt(pts)*90n,samples:[{duration:3600,size:4,flags:SYNC_FLAGS}],mdat:Uint8Array.of(0,0,0,0)});
+ const chunk=(pts=1000)=>buildChunk({trackId:1,bmdt:BigInt(pts*90),samples:[{duration:3600,size:4,flags:SYNC_FLAGS}],mdat:Uint8Array.of(0,0,0,0)});
  try{
  await player.load();await wire.accept(ref('catalog'),100n);await wire.send(ref('catalog'),catalog,1n);
  await wire.accept(ref('video'),200n);await wire.accept(ref('timeline'),300n);
@@ -38,7 +39,7 @@ async function fixture(options: {entries?: Entries; offset?:number; element?:boo
  observation:()=>player.stats.videoPresentationObservation,
  setWall:(n:number)=>{wall=n;},
  /** Element time of a source PTS: the assembler's own placement plus the native offset. */
- at(ptsMs:number){const f=assembler!.capturePresentationPlacement('video')!.toRebasedTimeUs(BigInt(ptsMs)*1000n)!;return Number(f.numerator)/Number(f.denominator)/1e6+offset;},
+ at(ptsMs:number){const f=assembler!.capturePresentationPlacement('video')!.toRebasedTimeUs(BigInt(ptsMs*1000))!;return Number(f.numerator)/Number(f.denominator)/1e6+offset;},
  setOffset:(n:number)=>{offset=n;},
  present(mediaTime:number){const pending=[...frames.values()];frames.clear();for(const cb of pending)cb(0,{mediaTime});},
  send:(pts=1000,group=1n,object=0n)=>wire.send(ref('video'),chunk(pts),group,object),
@@ -104,4 +105,52 @@ it('public stats JSON stays serializable with a presentation observation',async(
  const parsed=JSON.parse(JSON.stringify(f.player.stats)).videoPresentationObservation;
  expect(parsed.location).toEqual({groupId:'1',objectId:'0'});expect(parsed.encodeToPresentationMs).toBe(310);
  }finally{await f.close();}
+});
+
+it('matches the floor of the first sample PTS, including fractional milliseconds', async () => {
+ for (const pts of [1000.5, 999.5]) {
+  const f = await fixture({entries: [[1000, [1, 0], W]]});
+  try {
+   await f.send(pts);
+   expect(f.player.stats.videoEncodeObservation).not.toBeNull();
+   f.present(f.at(pts));
+   expect(f.observation() !== null).toBe(pts === 1000.5);
+  } finally { await f.close(); }
+ }
+});
+
+/** Insert a real edts/elst into the test header's moov/trak. */
+function editedInit(mediaTime: number, version: number): Uint8Array {
+ const entry = version === 1 ? concat(u64(0n), u64(BigInt(mediaTime))) : concat(u32(0), u32(mediaTime));
+ const edts = isoBox('edts', fullBox('elst', version, 0, u32(1), entry, u16(1), u16(0)));
+ const insert = (bytes: Uint8Array, path: string[]): Uint8Array => {
+  if (!path.length) return concat(bytes, edts);
+  const boxes: Uint8Array[] = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let pos = 0; pos < bytes.length;) {
+   const size = view.getUint32(pos), type = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8));
+   boxes.push(type === path[0] ? isoBox(type, insert(bytes.subarray(pos + 8, pos + size), path.slice(1))) : bytes.subarray(pos, pos + size));
+   pos += size;
+  }
+  return concat(...boxes);
+ };
+ return insert(buildInit({trackId: 1, timescale: 12800, handler: 'vide'}), ['moov', 'trak']);
+}
+it.each([0, 1])('does not date I-P-B-B frames behind a non-zero version %s edit list', async version => {
+ for (const mediaTime of [0, 512]) {
+  const f = await fixture({init: editedInit(mediaTime, version), entries: [[1040, [1, 0], W]]});
+  try {
+   // Decode order I-P-B-B; PTS order I-B-B-P, with 40 ms between frames.
+   const chunk = buildChunk({bmdt: 12800n, samples: [512, 1536, 0, 0].map((cto, i) => ({
+    duration: 512, size: 4, flags: i === 0 ? SYNC_FLAGS : NON_SYNC_FLAGS, cto,
+   }))});
+   await f.wire.send(ref('video'), chunk, 1n, 0n);
+   expect(f.player.stats.videoEncodeObservation).not.toBeNull();
+   // Element double emulates the measured Chrome behavior for ffmpeg B-frame DASH output:
+   // rVFC mediaTime is PTS - elst.media_time (plus placement/native offset).
+   for (const pts of [1040, 1080, 1120, 1160]) f.present(f.at(pts) - mediaTime / 12800);
+   expect(f.observation() !== null).toBe(mediaTime === 0);
+   expect(f.frames.size).toBe(0);
+  } finally { await f.close(); }
+ }
 });
