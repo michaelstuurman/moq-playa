@@ -2440,15 +2440,16 @@ export class MseMediaSource implements MediaSourceLike {
         this.holdKeySession(reuse.entry.session, event.initDataType, initData, reuse);
         return;
       }
+      this.logDebug('[DRM] creating a session frma=%s', describeFrma(initData));
       session = this.mediaKeys.createSession('temporary');
       const created = session;
       const retained = cache ? this.retainKeySession((revoke) =>
         cache.track(partition, created, event.initDataType, initData, revoke)) : null;
       this.holdKeySession(session, event.initDataType, initData, retained);
       await session.generateRequest(event.initDataType, initData);
-      this.logDebug('[DRM] generateRequest(%s) done', event.initDataType);
+      this.logDebug('[DRM] generateRequest(%s) done frma=%s', event.initDataType, describeFrma(initData));
     } catch (err) {
-      this.logWarn('[DRM] session failed: %s', String(err));
+      this.logWarn('[DRM] session failed frma=%s: %s', describeFrma(initData), String(err));
       if (session && !this.keySessions.has(session)) return;
       if (session) this.retireKeySession(session);
       this.reportDrmError('session', err);
@@ -2462,7 +2463,8 @@ export class MseMediaSource implements MediaSourceLike {
   private handleKeyMessage = async (event: MediaKeyMessageEvent): Promise<void> => {
     const session = event.target as MediaKeySession;
     const state = this.keySessions.get(session);
-    this.logDebug('[DRM] message: type=%s bytes=%d', event.messageType, event.message?.byteLength ?? -1);
+    this.logDebug('[DRM] message: type=%s bytes=%d frma=%s', event.messageType, event.message?.byteLength ?? -1,
+      state ? describeFrma(state.initData) : 'unknown session');
     if (!this.drmConfig || !state || this.destroyed) return;
     const live = (): boolean => !this.destroyed && this.keySessions.get(session) === state;
     try {
@@ -2472,7 +2474,7 @@ export class MseMediaSource implements MediaSourceLike {
         signal: state.abort.signal,
       });
       if (!live()) return;
-      this.logDebug('[DRM] license POST: %d', response.status);
+      this.logDebug('[DRM] license POST: %d frma=%s', response.status, describeFrma(state.initData));
       if (!response.ok) {
         throw new Error(`License server returned ${response.status} ${response.statusText}`);
       }
@@ -2502,7 +2504,7 @@ export class MseMediaSource implements MediaSourceLike {
         const statuses: string[] = [];
         session.keyStatuses.forEach((status) => statuses.push(status));
         const now = statuses.join(',') || 'none';
-        if (now !== last) this.logDebug('[DRM] key statuses: %s', now);
+        if (now !== last) this.logDebug('[DRM] key statuses: %s frma=%s', now, describeFrma(this.keySessions.get(session)?.initData ?? new Uint8Array()));
         last = now;
       };
       session.addEventListener('keystatuseschange', onStatuses);
