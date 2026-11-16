@@ -640,3 +640,48 @@ describe('catalog selection model', () => {
     });
   });
 });
+
+describe('catalog selection — codecs the browser cannot play', () => {
+  // Opus and AAC of the same programme in one alternate group, Opus first:
+  // Safari's MediaSource refuses Opus in MP4, so the default must be AAC there.
+  const opusAndAac = () => catalog([
+    { name: 'video', role: 'video', packaging: 'cmaf', codec: 'avc1.640020' },
+    { name: 'opus.pair1', role: 'audio', packaging: 'cmaf', altGroup: 2, codec: 'opus' },
+    { name: 'aac.pair1', role: 'audio', packaging: 'cmaf', altGroup: 2, codec: 'mp4a.40.2' },
+  ]);
+
+  function withMediaSource<T>(supported: (type: string) => boolean, run: () => T): T {
+    const g = globalThis as { MediaSource?: unknown };
+    const before = g.MediaSource;
+    g.MediaSource = { isTypeSupported: supported };
+    try { return run(); } finally { g.MediaSource = before; }
+  }
+
+  it('defaults to the first member the browser can play', () => {
+    const outcome = withMediaSource(type => !type.includes('opus'), () => resolve(opusAndAac()));
+    if (!outcome.ok) throw new Error(outcome.reason);
+    expect(outcome.audio?.track.id.name).toBe('aac.pair1');
+    expect(outcome.video?.track.id.name).toBe('video');
+  });
+
+  it('keeps catalog order when the browser plays both, or cannot be asked', () => {
+    const both = withMediaSource(() => true, () => resolve(opusAndAac()));
+    if (!both.ok) throw new Error(both.reason);
+    expect(both.audio?.track.id.name).toBe('opus.pair1');
+    const none = resolve(opusAndAac());
+    if (!none.ok) throw new Error(none.reason);
+    expect(none.audio?.track.id.name).toBe('opus.pair1');
+  });
+
+  it('falls back to catalog order when the browser plays no member', () => {
+    const outcome = withMediaSource(type => type.startsWith('video/'), () => resolve(opusAndAac()));
+    if (!outcome.ok) throw new Error(outcome.reason);
+    expect(outcome.audio?.track.id.name).toBe('opus.pair1');
+  });
+
+  it('applies to an asked-for alternate group too', () => {
+    const byGroup = withMediaSource(type => !type.includes('opus'), () => resolve(opusAndAac(), { audioAltGroup: 2 } as SelectionIntent));
+    if (!byGroup.ok) throw new Error(byGroup.reason);
+    expect(byGroup.audio?.track.id.name).toBe('aac.pair1');
+  });
+});

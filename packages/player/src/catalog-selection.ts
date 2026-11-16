@@ -395,10 +395,33 @@ function findSetContaining(
   return null;
 }
 
+/**
+ * Whether this browser's MediaSource can take a CMAF track's codec. Unknown
+ * (no MediaSource, no codec, or another packaging) counts as playable, so
+ * outside a browser the defaults stay pure catalog order.
+ */
+function mseCanPlay(track: SelectableTrack): boolean {
+  const { packaging, codec } = track.track as { packaging?: string; codec?: string };
+  if (packaging !== 'cmaf' || !codec) return true;
+  const MS = (globalThis as { MediaSource?: { isTypeSupported?: (type: string) => boolean } }).MediaSource;
+  if (typeof MS?.isTypeSupported !== 'function') return true;
+  return MS.isTypeSupported(`${track.mediaType}/mp4; codecs="${codec}"`);
+}
+
+/**
+ * The first member of `set` this browser can play, else the first member.
+ * An alternate group may offer the same content in codecs a browser does not
+ * all take (Opus and AAC: Safari's MSE refuses Opus in MP4).
+ */
+function firstPlayable(set: AlternateSet): SelectableTrack {
+  return set.tracks.find(mseCanPlay) ?? set.tracks[0]!;
+}
+
 function defaultFrom(sets: readonly AlternateSet[]): ResolvedMedia | null {
-  const set = sets[0];
-  if (!set || set.tracks.length === 0) return null;
-  return { set, track: set.tracks[0]! };
+  const usable = sets.filter(s => s.tracks.length > 0);
+  const set = usable.find(s => s.tracks.some(mseCanPlay)) ?? usable[0];
+  if (!set) return null;
+  return { set, track: firstPlayable(set) };
 }
 
 /**
@@ -567,7 +590,7 @@ function pickMember(
     if (!set || set.tracks.length === 0) {
       return { ok: false, reason: `declares no alternate group ${wantAltGroup}` };
     }
-    return { ok: true, media: { set, track: set.tracks[0]! } };
+    return { ok: true, media: { set, track: firstPlayable(set) } };
   }
   return { ok: true, media: defaultFrom(sets) };
 }
