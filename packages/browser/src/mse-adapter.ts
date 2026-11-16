@@ -2394,15 +2394,24 @@ export class MseMediaSource implements MediaSourceLike {
   };
 
   private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
-    this.logDebug('[DRM] encrypted: initDataType=%s bytes=%d', event.initDataType, event.initData?.byteLength ?? -1);
-    if (this.destroyed || !this.drmConfig || !event.initData) return;
+    if (this.destroyed || !this.drmConfig || !event.initData) {
+      this.logDebug('[DRM] encrypted: initDataType=%s bytes=%d', event.initDataType, event.initData?.byteLength ?? -1);
+      return;
+    }
     const initData = new Uint8Array(event.initData).slice();
+    // Which track the initialization names (frma) and a short fingerprint, so
+    // two events for audio and video can be told apart in the log.
+    this.logDebug('[DRM] encrypted: initDataType=%s bytes=%d frma=%s fp=%s', event.initDataType, initData.byteLength,
+      describeFrma(initData), drmFingerprint(initData));
     let session: MediaKeySession | null = null;
     try {
       await this.mediaKeysReady;
       if (this.destroyed || !this.mediaKeys) return;
       for (const state of this.keySessions.values()) {
-        if (state.initDataType === event.initDataType && equalDrmBytes(state.initData, initData)) return;
+        if (state.initDataType === event.initDataType && equalDrmBytes(state.initData, initData)) {
+          this.logDebug('[DRM] encrypted: same initialization as a held session, nothing to do');
+          return;
+        }
       }
       const cache = this.drmConfig.sessionCache;
       const partition = cache ? drmPartition(this.drmConfig.keySystem ?? 'com.widevine.alpha',
@@ -2411,6 +2420,7 @@ export class MseMediaSource implements MediaSourceLike {
       const reuse = cache ? this.retainKeySession((revoke) =>
         cache.acquire(partition, event.initDataType, initData, revoke)) : null;
       if (reuse) {
+        this.logDebug('[DRM] encrypted: reusing a usable cached session');
         // Already licensed and usable: no generateRequest, no license POST.
         this.holdKeySession(reuse.entry.session, event.initDataType, initData, reuse);
         return;
@@ -4632,4 +4642,21 @@ function describeAccess(access: MediaKeySystemAccess): string {
   } catch (err) {
     return `(no configuration: ${String(err)})`;
   }
+}
+
+/** The original format a protection scheme box names ('frma'), or '-'. Diagnostics only. */
+function describeFrma(bytes: Uint8Array): string {
+  for (let i = 0; i + 12 <= bytes.length; i++) {
+    if (bytes[i] === 0x66 && bytes[i + 1] === 0x72 && bytes[i + 2] === 0x6d && bytes[i + 3] === 0x61) {
+      return String.fromCharCode(bytes[i + 4]!, bytes[i + 5]!, bytes[i + 6]!, bytes[i + 7]!);
+    }
+  }
+  return '-';
+}
+
+/** A short FNV-1a fingerprint of initialization data. Diagnostics only; no key material. */
+function drmFingerprint(bytes: Uint8Array): string {
+  let h = 0x811c9dc5;
+  for (const b of bytes) h = Math.imul(h ^ b, 0x01000193) >>> 0;
+  return h.toString(16).padStart(8, '0');
 }
