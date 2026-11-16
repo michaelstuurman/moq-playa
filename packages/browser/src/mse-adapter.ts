@@ -2390,7 +2390,11 @@ export class MseMediaSource implements MediaSourceLike {
    */
   /** Diagnostics only: the element waits for a key it was never asked for. */
   private handleWaitingForKey = (event: Event): void => {
-    this.logDebug('[DRM] %s (mediaKeys=%s)', event.type, this.video.mediaKeys ? 'set' : 'none');
+    // WebKit's prefixed webkitneedkey carries the track's initData too.
+    const raw = (event as Event & { initData?: ArrayBuffer | Uint8Array }).initData;
+    const initData = raw ? new Uint8Array(raw instanceof Uint8Array ? raw : new Uint8Array(raw)) : null;
+    this.logDebug('[DRM] %s (mediaKeys=%s)%s', event.type, this.video.mediaKeys ? 'set' : 'none',
+      initData ? ` bytes=${initData.byteLength} frma=${describeFrma(initData)} fp=${drmFingerprint(initData)}` : '');
   };
 
   private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
@@ -4644,8 +4648,19 @@ function describeAccess(access: MediaKeySystemAccess): string {
   }
 }
 
-/** The original format a protection scheme box names ('frma'), or '-'. Diagnostics only. */
+/**
+ * The original format a protection scheme box names ('frma'), or '-'. Safari's
+ * FairPlay 'sinf' initData is JSON with the box(es) in base64 ({"sinf": ...});
+ * the raw box is searched too. Diagnostics only.
+ */
 function describeFrma(bytes: Uint8Array): string {
+  try {
+    const json = JSON.parse(new TextDecoder().decode(bytes)) as { sinf?: string | string[] };
+    const list = json.sinf === undefined ? [] : Array.isArray(json.sinf) ? json.sinf : [json.sinf];
+    if (list.length > 0) {
+      return list.map(b64 => describeFrma(Uint8Array.from(atob(b64), c => c.charCodeAt(0)))).join('+');
+    }
+  } catch { /* not JSON: a raw box */ }
   for (let i = 0; i + 12 <= bytes.length; i++) {
     if (bytes[i] === 0x66 && bytes[i + 1] === 0x72 && bytes[i + 2] === 0x6d && bytes[i + 3] === 0x61) {
       return String.fromCharCode(bytes[i + 4]!, bytes[i + 5]!, bytes[i + 6]!, bytes[i + 7]!);
