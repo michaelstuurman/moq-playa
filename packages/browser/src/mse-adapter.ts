@@ -2395,6 +2395,17 @@ export class MseMediaSource implements MediaSourceLike {
     const initData = raw ? new Uint8Array(raw instanceof Uint8Array ? raw : new Uint8Array(raw)) : null;
     this.logDebug('[DRM] %s (mediaKeys=%s)%s', event.type, this.video.mediaKeys ? 'set' : 'none',
       initData ? ` bytes=${initData.byteLength} frma=${describeFrma(initData)} fp=${drmFingerprint(initData)}` : '');
+    // Safari raises the standard 'encrypted' event for only one of two tracks
+    // that share a key (seen: video yes, audio no), while its prefixed
+    // webkitneedkey arrives for each, with the track's own 'sinf' initData.
+    // FairPlay binds a key to the track's own request, so the other track gets
+    // its own session from that initData. An initialization already held is
+    // skipped in handleEncrypted, so the track that did raise 'encrypted' is
+    // not requested twice.
+    if (event.type === 'webkitneedkey' && initData && isFairplay(this.drmConfig?.keySystem)) {
+      void this.handleEncrypted({ initDataType: 'sinf', initData: initData.buffer.slice(
+        initData.byteOffset, initData.byteOffset + initData.byteLength) } as MediaEncryptedEvent);
+    }
   };
 
   private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {

@@ -3966,6 +3966,29 @@ describe('MseMediaSource DRM lifecycle', () => {
         expect(requestAccess).not.toHaveBeenCalled();
     });
 
+    it('FairPlay requests a session for a track Safari only names in webkitneedkey', async () => {
+        const { video, encrypted, sessions } = setup(Uint8Array.of(9), undefined, { keySystem: 'com.apple.fps' });
+        const needkey = async (id: number) => {
+            video.dispatch({ type: 'webkitneedkey', initData: Uint8Array.of(id) } as unknown as Event);
+            await settle();
+        };
+        // Video: webkitneedkey and encrypted, same initialization: one session.
+        await needkey(1);
+        await encrypted(1, 'sinf');
+        // Audio: only webkitneedkey, its own initialization: a second session.
+        await needkey(2);
+        expect(sessions).toHaveLength(2);
+        expect(sessions[0]!.generateRequest).toHaveBeenCalledTimes(1);
+        expect(sessions[1]!.generateRequest).toHaveBeenCalledWith('sinf', expect.anything());
+    });
+
+    it('ignores webkitneedkey outside FairPlay', async () => {
+        const { video, sessions } = setup();
+        video.dispatch({ type: 'webkitneedkey', initData: Uint8Array.of(2) } as unknown as Event);
+        await settle();
+        expect(sessions).toHaveLength(0);
+    });
+
     it('deduplicates identical initialization while key setup is pending', async () => {
         const pending = deferred<void>();
         const { encrypted, sessions } = setup(undefined, pending.promise);
