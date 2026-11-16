@@ -38,10 +38,19 @@ describe('LiveEdgeController', () => {
         expect(r.jumps).toBe(0);
     });
 
-    it('jumps a lag of more than a second above the target', () => {
+    it('jumps a lag of more than three seconds above the target, at most once per 10 s', () => {
         const c = new LiveEdgeController(0.35);
-        const step = c.step(0, 5.2);
-        expect(step).toEqual({ rate: 1, jumpTo: 0.35 });
+        expect(c.step(0, 5.2)).toEqual({ rate: 1, jumpTo: 0.35 });
+        // Right after a jump the buffer refills while the browser seeks: no second jump.
+        expect(c.step(2_000, 5.2).jumpTo).toBeUndefined();
+        expect(c.step(10_000, 5.2).jumpTo).toBe(0.35);
+    });
+
+    it('closes a lag of one or two seconds by rate, not by a jump', () => {
+        const c = new LiveEdgeController(0.35);
+        const step = c.step(0, 1.6);
+        expect(step.jumpTo).toBeUndefined();
+        expect(step.rate).toBeGreaterThan(1);
     });
 
     it('lowers the target to its minimum on a smooth stream', () => {
@@ -87,8 +96,8 @@ describe('LiveEdgeController', () => {
         expect(c.targetS).toBe(0.2);
     });
 
-    it('limits the rate to 0.97 .. 1.05', () => {
-        expect(new LiveEdgeController(0.35).step(0, 1.2).rate).toBe(1.05);
+    it('limits the rate to 0.97 .. 1.10', () => {
+        expect(new LiveEdgeController(0.35).step(0, 1.2).rate).toBe(1.1);
         expect(new LiveEdgeController(0.35).step(0, 0.0).rate).toBe(0.97);
         expect(new LiveEdgeController(0.35).step(0, 0.36).rate).toBe(1);
     });

@@ -665,6 +665,16 @@ describe('selection composition — audio the browser cannot play', () => {
     expect(audioName(result)).toBe('opus.pair1');
   });
 
+  it('asks ManagedMediaSource where it is the only one (iOS Safari)', () => {
+    const g = globalThis as { MediaSource?: unknown; ManagedMediaSource?: unknown };
+    const before = [g.MediaSource, g.ManagedMediaSource];
+    g.MediaSource = undefined;
+    g.ManagedMediaSource = { isTypeSupported: noOpus };
+    try {
+      expect(audioName(compose(opusAndAac()).result)).toBe('aac.pair1');
+    } finally { [g.MediaSource, g.ManagedMediaSource] = before; }
+  });
+
   it('keeps the offered tracks when the browser plays none of them', () => {
     const { result } = withMediaSource(type => type.startsWith('video/'), () => compose(opusAndAac()));
     expect(audioName(result)).toBe('opus.pair1');

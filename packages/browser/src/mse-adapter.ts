@@ -1447,7 +1447,12 @@ export class MseMediaSource implements MediaSourceLike {
       entry: { codec: string; initData: Uint8Array },
     ): Error | null => {
       const mimeType = `${mediaType}/mp4; codecs="${entry.codec}"`;
-      const MS = (globalThis as { MediaSource?: { isTypeSupported?: (m: string) => boolean } }).MediaSource;
+      // iOS Safari exposes only ManagedMediaSource, with the same static check.
+      const g = globalThis as {
+        MediaSource?: { isTypeSupported?: (m: string) => boolean };
+        ManagedMediaSource?: { isTypeSupported?: (m: string) => boolean };
+      };
+      const MS = typeof g.MediaSource?.isTypeSupported === 'function' ? g.MediaSource : g.ManagedMediaSource;
       if (typeof MS?.isTypeSupported === 'function' && !MS.isTypeSupported(mimeType)) {
         const err = new Error(`Codec not supported by this UA: ${mimeType}`);
         err.name = 'CodecUnsupportedError';

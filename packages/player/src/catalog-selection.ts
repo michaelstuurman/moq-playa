@@ -396,14 +396,20 @@ function findSetContaining(
 }
 
 /**
- * Whether this browser's MediaSource can take a CMAF track's codec. Unknown
- * (no MediaSource, no codec, or another packaging) counts as playable, so
+ * Whether this browser's MediaSource (or ManagedMediaSource, on iOS) can take
+ * a CMAF track's codec. Unknown (neither present, no codec, or another
+ * packaging) counts as playable, so
  * outside a browser the defaults stay pure catalog order.
  */
 export function mseCanPlay(track: SelectableTrack): boolean {
   const { packaging, codec } = track.track as { packaging?: string; codec?: string };
   if (packaging !== 'cmaf' || !codec) return true;
-  const MS = (globalThis as { MediaSource?: { isTypeSupported?: (type: string) => boolean } }).MediaSource;
+  // iOS Safari exposes only ManagedMediaSource, with the same static check.
+  const g = globalThis as {
+    MediaSource?: { isTypeSupported?: (type: string) => boolean };
+    ManagedMediaSource?: { isTypeSupported?: (type: string) => boolean };
+  };
+  const MS = typeof g.MediaSource?.isTypeSupported === 'function' ? g.MediaSource : g.ManagedMediaSource;
   if (typeof MS?.isTypeSupported !== 'function') return true;
   return MS.isTypeSupported(`${track.mediaType}/mp4; codecs="${codec}"`);
 }

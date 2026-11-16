@@ -26,10 +26,17 @@ const LOWER_PER_S = 0.01;
 const STALL_STEP_S = 0.1;
 const STALL_HOLD_MS = 30_000;
 const DEADBAND_S = 0.03;
-const JUMP_ABOVE_S = 1.0;
+/**
+ * A jump seeks the element, and a browser decodes from the previous keyframe
+ * to get there (Safari visibly so, with 1 s GOPs). While it does, the buffer
+ * grows again, so jumps are kept for real lag and spaced out; smaller lag is
+ * closed by rate.
+ */
+const JUMP_ABOVE_S = 3.0;
+const JUMP_COOLDOWN_MS = 10_000;
 /** Rate change per second of error, and its limits. */
 const GAIN = 0.4;
-const MAX_FASTER = 0.05;
+const MAX_FASTER = 0.1;
 const MAX_SLOWER = 0.03;
 
 export class LiveEdgeController {
@@ -37,6 +44,7 @@ export class LiveEdgeController {
     private target: number;
     private lastMs: number | undefined;
     private holdUntilMs = 0;
+    private lastJumpMs = -Infinity;
     // A slow average of the buffer ahead, and the dips below it as [time, depth].
     private mean: number | undefined;
     private dips: Array<[number, number]> = [];
@@ -64,7 +72,8 @@ export class LiveEdgeController {
         const dt = this.lastMs === undefined ? 0 : Math.max(0, nowMs - this.lastMs) / 1000;
         this.lastMs = nowMs;
 
-        if (aheadS > this.target + JUMP_ABOVE_S) {
+        if (aheadS > this.target + JUMP_ABOVE_S && nowMs - this.lastJumpMs >= JUMP_COOLDOWN_MS) {
+            this.lastJumpMs = nowMs;
             this.dips = [];
             this.mean = undefined;
             return { rate: 1, jumpTo: this.target };
