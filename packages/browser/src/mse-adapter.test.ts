@@ -3982,6 +3982,20 @@ describe('MseMediaSource DRM lifecycle', () => {
         expect(sessions[1]!.generateRequest).toHaveBeenCalledWith('sinf', expect.anything());
     });
 
+    it('FairPlay combined mode asks for the sinf of every track in one request', async () => {
+        const { video, sessions } = setup(Uint8Array.of(9), undefined, { keySystem: 'com.apple.fps', fairplaySinf: 'combined' });
+        const sinf = (b64: string) => new TextEncoder().encode(JSON.stringify({ sinf: b64 }));
+        video.dispatch({ type: 'webkitneedkey', initData: sinf('VIDEO') } as unknown as Event);
+        video.dispatch({ type: 'encrypted', initDataType: 'sinf', initData: sinf('VIDEO').buffer } as unknown as Event);
+        video.dispatch({ type: 'webkitneedkey', initData: sinf('AUDIO') } as unknown as Event);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        await settle();
+        expect(sessions).toHaveLength(1);
+        const [type, data] = sessions[0]!.generateRequest.mock.calls[0]!;
+        expect(type).toBe('sinf');
+        expect(JSON.parse(new TextDecoder().decode(data as ArrayBuffer))).toEqual({ sinf: ['VIDEO', 'AUDIO'] });
+    });
+
     it('ignores webkitneedkey outside FairPlay', async () => {
         const { video, sessions } = setup();
         video.dispatch({ type: 'webkitneedkey', initData: Uint8Array.of(2) } as unknown as Event);

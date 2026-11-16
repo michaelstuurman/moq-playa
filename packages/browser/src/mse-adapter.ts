@@ -257,6 +257,12 @@ export interface DrmConfig {
   /** Optional license-server certificate passed to the CDM. */
   readonly serverCertificate?: Uint8Array;
   /**
+   * FairPlay only, experimental: 'combined' gathers the 'sinf' of every track
+   * Safari names within a short window and asks for them in ONE key request
+   * ({"sinf": [video, audio]}), instead of one session per track.
+   */
+  readonly fairplaySinf?: 'per-track' | 'combined';
+  /**
    * Opt-in retention of MediaKeys and usable sessions beyond this adapter.
    * The caller owns its lifetime and closes it with the player. Without it,
    * every adapter requests its own licenses and closes them on destroy().
@@ -836,6 +842,10 @@ export class MseMediaSource implements MediaSourceLike {
   // same element. Sessions and license requests remain adapter-owned.
   private static readonly drmElements = new WeakMap<HTMLVideoElement, DrmElementState>();
   private readonly loggedKeySessions = new WeakSet<MediaKeySession>();
+  /** FairPlay 'combined' mode: sinf boxes (base64) seen so far, and whether the request went out. */
+  private fpsSinfs: string[] = [];
+  private fpsCombinedTimer: ReturnType<typeof setTimeout> | null = null;
+  private fpsCombinedSent = false;
 
   // ── Playhead-wedge watchdog state ──
   /** Watchdog cadence; detection threshold per escalation rung. */
@@ -2389,6 +2399,32 @@ export class MseMediaSource implements MediaSourceLike {
    * and fetches the license from the configured server.
    */
   /** Diagnostics only: the element waits for a key it was never asked for. */
+  /** FairPlay 'combined' mode: remember this track's sinf; send one request for all of them shortly. */
+  private collectFairplaySinf(initData: Uint8Array): void {
+    let list: string[] = [];
+    try {
+      const json = JSON.parse(new TextDecoder().decode(initData)) as { sinf?: string | string[] };
+      list = json.sinf === undefined ? [] : Array.isArray(json.sinf) ? json.sinf : [json.sinf];
+    } catch { /* not JSON */ }
+    const fresh = list.filter(b64 => !this.fpsSinfs.includes(b64));
+    this.logDebug('[DRM] combined: sinf frma=%s %s', describeFrma(initData), fresh.length ? 'collected' : 'already collected');
+    if (fresh.length === 0) return;
+    this.fpsSinfs.push(...fresh);
+    if (this.fpsCombinedSent) {
+      this.logDebug('[DRM] combined: a track arrived after the request went out (frma=%s); not requested', describeFrma(initData));
+      return;
+    }
+    if (this.fpsCombinedTimer !== null) return;
+    this.fpsCombinedTimer = setTimeout(() => {
+      this.fpsCombinedTimer = null;
+      if (this.destroyed) return;
+      this.fpsCombinedSent = true;
+      const bytes = new TextEncoder().encode(JSON.stringify({ sinf: this.fpsSinfs }));
+      this.logDebug('[DRM] combined: one request for %d sinf', this.fpsSinfs.length);
+      void this.handleEncrypted({ initDataType: 'sinf', initData: bytes.buffer, combined: true } as unknown as MediaEncryptedEvent);
+    }, 50);
+  }
+
   private handleWaitingForKey = (event: Event): void => {
     // WebKit's prefixed webkitneedkey carries the track's initData too.
     const raw = (event as Event & { initData?: ArrayBuffer | Uint8Array }).initData;
@@ -2414,6 +2450,11 @@ export class MseMediaSource implements MediaSourceLike {
       return;
     }
     const initData = new Uint8Array(event.initData).slice();
+    if (event.initDataType === 'sinf' && isFairplay(this.drmConfig.keySystem)
+        && this.drmConfig.fairplaySinf === 'combined' && !(event as { combined?: boolean }).combined) {
+      this.collectFairplaySinf(initData);
+      return;
+    }
     // Which track the initialization names (frma) and a short fingerprint, so
     // two events for audio and video can be told apart in the log.
     this.logDebug('[DRM] encrypted: initDataType=%s bytes=%d frma=%s fp=%s', event.initDataType, initData.byteLength,

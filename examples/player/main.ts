@@ -1440,7 +1440,8 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
                 mseImplementation: mseImpl,
                 mseAttachment: mseAttach,
                 ...(gapJumpParam !== null ? { gapJumpMs: Number(gapJumpParam) } : {}),
-                ...(drmConfig ? { drmConfig: { ...drmConfig, sessionCache: drmSessionCache } } : {}),
+                ...(drmConfig ? { drmConfig: { ...drmConfig, sessionCache: drmSessionCache,
+                    ...(params.get('fpssinf') === 'combined' ? { fairplaySinf: 'combined' as const } : {}) } } : {}),
             });
             ms.debug = mseDebug;
             mediaSourceRef = ms;
