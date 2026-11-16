@@ -631,3 +631,42 @@ describe('selection + quality composition', () => {
     });
   });
 });
+
+describe('selection composition — audio the browser cannot play', () => {
+  // Opus before AAC of the same programme; Safari's MSE refuses Opus in MP4.
+  const opusAndAac = () => catalog([
+    { name: 'video', role: 'video', packaging: 'cmaf', codec: 'avc1.640020' },
+    { name: 'opus.pair1', role: 'audio', packaging: 'cmaf', altGroup: 2, codec: 'opus' },
+    { name: 'aac.pair1', role: 'audio', packaging: 'cmaf', altGroup: 2, codec: 'mp4a.40.2' },
+  ]);
+
+  function withMediaSource<T>(supported: (type: string) => boolean, run: () => T): T {
+    const g = globalThis as { MediaSource?: unknown };
+    const before = g.MediaSource;
+    g.MediaSource = { isTypeSupported: supported };
+    try { return run(); } finally { g.MediaSource = before; }
+  }
+  const noOpus = (type: string) => !type.includes('opus');
+
+  it('plays the AAC member when the browser refuses Opus', () => {
+    const { result } = withMediaSource(noOpus, () => compose(opusAndAac()));
+    expect(audioName(result)).toBe('aac.pair1');
+    expect(videoName(result)).toBe('video');
+  });
+
+  it('keeps catalog order when the browser plays both, or cannot be asked', () => {
+    expect(audioName(withMediaSource(() => true, () => compose(opusAndAac())).result)).toBe('opus.pair1');
+    expect(audioName(compose(opusAndAac()).result)).toBe('opus.pair1');
+  });
+
+  it('never replaces an asked-for track', () => {
+    const intent = { audioTrack: { name: 'opus.pair1', namespaceFields: [...NS_FIELDS] } } as SelectionIntent;
+    const { result } = withMediaSource(noOpus, () => compose(opusAndAac(), intent));
+    expect(audioName(result)).toBe('opus.pair1');
+  });
+
+  it('keeps the offered tracks when the browser plays none of them', () => {
+    const { result } = withMediaSource(type => type.startsWith('video/'), () => compose(opusAndAac()));
+    expect(audioName(result)).toBe('opus.pair1');
+  });
+});

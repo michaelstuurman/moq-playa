@@ -400,7 +400,7 @@ function findSetContaining(
  * (no MediaSource, no codec, or another packaging) counts as playable, so
  * outside a browser the defaults stay pure catalog order.
  */
-function mseCanPlay(track: SelectableTrack): boolean {
+export function mseCanPlay(track: SelectableTrack): boolean {
   const { packaging, codec } = track.track as { packaging?: string; codec?: string };
   if (packaging !== 'cmaf' || !codec) return true;
   const MS = (globalThis as { MediaSource?: { isTypeSupported?: (type: string) => boolean } }).MediaSource;

@@ -18,7 +18,7 @@ import type { CatalogNamespaceContext, CatalogState, CatalogTrack, TrackConstrai
 import { selectTrack } from '@openmoq/msf';
 import type { QualityController } from './quality-controller.js';
 import { preferredLanguage } from './language-preference.js';
-import {
+import { mseCanPlay,
   buildCatalogSelection,
   resolveSelection,
   type AlternateSet,
@@ -167,8 +167,14 @@ export function composeResolvedSelection(
   // An explicit audio selector keeps its restriction: a constraint then
   // applies within that set only.
   const audioRestricted = intent.audioTrack !== undefined || intent.audioAltGroup !== undefined;
-  const audioCandidates = audioRestricted
+  const audioOffered = audioRestricted
     ? (resolved.audio ? [...resolved.audio.set.tracks] : []) : audioConsidered;
+  // Members this browser's MediaSource cannot take are left out while another
+  // remains (Safari refuses Opus in MP4 next to an AAC alternative). An
+  // explicit track is never replaced: it is validated as asked below.
+  const audioPlayable = audioOffered.filter(mseCanPlay);
+  const audioCandidates = intent.audioTrack === undefined && audioPlayable.length > 0
+    ? audioPlayable : audioOffered;
 
   const byTrack = new Map<CatalogTrack, SelectableTrack>(
     [...videoDeclared, ...audioConsidered, ...audioCandidates].map(t => [t.track, t]));
