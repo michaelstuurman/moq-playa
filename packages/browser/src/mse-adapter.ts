@@ -3217,6 +3217,10 @@ export class MseMediaSource implements MediaSourceLike {
         // range), so the two never race for the same playhead state.
         this.checkGapJump(nowMs);
         this.checkPlayheadWedge(nowMs);
+        if (this.debug && !this.video.paused && this.video.readyState <= 2) {
+          this.stallLogTicks++;
+          if (this.stallLogTicks <= 10 || this.stallLogTicks % 10 === 0) this.logBufferedAtWait(`stuck ${this.stallLogTicks}s`);
+        }
       },
       MseMediaSource.WEDGE_CHECK_INTERVAL_MS,
     );
@@ -4564,7 +4568,32 @@ export class MseMediaSource implements MediaSourceLike {
     if (recoveredMs !== null) this.onStallRecovered?.(recoveredMs);
   };
 
+  /** Debug: watchdog ticks logged in the current freeze. */
+  private stallLogTicks = 0;
+
+  /** Debug: the buffered ranges of each SourceBuffer near the playhead, per track. */
+  private logBufferedAtWait(why: string): void {
+    if (!this.debug) return;
+    const t = this.video.currentTime;
+    const show = (buffer: SourceBuffer | null): string => {
+      const r = buffer ? safeBuffered(buffer) : null;
+      if (!r) return 'none';
+      const out: string[] = [];
+      for (let i = 0; i < r.length; i++) {
+        if (r.end(i) < t - 2 || r.start(i) > t + 5) continue;
+        out.push(`${r.start(i).toFixed(3)}-${r.end(i).toFixed(3)}`);
+      }
+      return `${r.length} ranges [${out.join(' ')}]`;
+    };
+    this.logDebug('[STALL] %s t=%s ready=%d video: %s | audio: %s | element: %s', why, t.toFixed(3),
+      this.video.readyState, show(this.videoBuffer), show(this.audioBuffer),
+      Array.from({ length: this.video.buffered.length }, (_, i) =>
+        `${this.video.buffered.start(i).toFixed(3)}-${this.video.buffered.end(i).toFixed(3)}`).join(' '));
+  }
+
   private handleWaiting = (): void => {
+    this.stallLogTicks = 0;
+    this.logBufferedAtWait('waiting');
     if (this.seekResource && !this.seekResource.released) return;
     // A gap-jump's own seek emits a waiting; the adapter already reported
     // that stall itself (cause 'media-gap') — don't arm a duplicate. The

@@ -269,12 +269,12 @@ let mediaSourceRef: MseMediaSource | null = null;
 // whose keys are already licensed reuses that license.
 const drmSessionCache = new DrmSessionCache();
 
-// ?msedebug=1 also shows the adapter's [DRM] console lines in the on-page log,
+// ?msedebug=1 also shows the adapter's [DRM] and [STALL] console lines in the on-page log,
 // for a device without a console (an iPhone). They hold no key material.
 if (params.get('msedebug') === '1') {
     const mirror = (original: (...args: unknown[]) => void, mark: string) => (...args: unknown[]): void => {
         original(...args);
-        if (typeof args[0] !== 'string' || !args[0].startsWith('[DRM]')) return;
+        if (typeof args[0] !== 'string' || !/^\[(DRM|STALL)\]/.test(args[0])) return;
         let next = 1;
         const text = args[0].replace(/%[sdo]/g, () => String(args[next++]));
         log(mark + [text, ...args.slice(next).map(String)].join(' '));
