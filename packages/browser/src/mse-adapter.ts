@@ -918,6 +918,8 @@ export class MseMediaSource implements MediaSourceLike {
   // ── Live-buffer management (eviction / behind-live cap / quota recovery) ──
   /** Seconds of played-out media kept behind currentTime; older data is evicted. */
   private readonly keepBehindSec: number;
+  /** Where the last back-buffer remove ended, per track (see maybeEvictBackBuffer). */
+  private readonly lastEvictBefore: { video: number | null; audio: number | null } = { video: null, audio: null };
   /** Buffered-ahead cap: beyond this, jump toward the live edge (post-startup only). */
   private readonly maxAheadSec: number;
   /** Where a live-edge jump lands: rangeEnd - targetAheadSec. */
@@ -2215,6 +2217,8 @@ export class MseMediaSource implements MediaSourceLike {
     }
     this.diag('reset (buffer generation %d → %d)', this.bufferGen, this.bufferGen + 1);
     this.bufferGen++;
+    this.lastEvictBefore.video = null;
+    this.lastEvictBefore.audio = null;
     this.revokeSwitchRecovery();
     this.appendQueueHold = null;
     this.clearAppendGap('video'); this.clearAppendGap('audio');
@@ -2702,9 +2706,19 @@ export class MseMediaSource implements MediaSourceLike {
     // Hysteresis: only evict once at least 1s of stale media has accumulated,
     // so we don't churn a remove() per append.
     if (evictBefore - start < 1) return false;
+    // A remove() need not empty its range: Safari keeps an audio frame that
+    // straddles the bound, and buffered.start(0) then never moves. Measured
+    // from buffered.start(0) alone, every append would issue another remove
+    // and starve the appends. So the next remove waits until the playhead
+    // has moved a second past the previous one.
+    const last = this.lastEvictBefore[mediaType];
+    if (last !== null && evictBefore >= last && evictBefore - last < 1) return false;
+    this.lastEvictBefore[mediaType] = evictBefore;
+    // From 0, not from start: a frame at start is then inside the range.
+    const from = 0;
     try {
-      this.runMutation(mediaType, 'back-buffer-remove', () => buffer.remove(start, evictBefore));
-      this.logDebug('[MSE] evict %s back-buffer [%s, %s)', mediaType, start.toFixed(2), evictBefore.toFixed(2));
+      this.runMutation(mediaType, 'back-buffer-remove', () => buffer.remove(from, evictBefore));
+      this.logDebug('[MSE] evict %s back-buffer [%s, %s) (buffered from %s)', mediaType, from.toFixed(2), evictBefore.toFixed(2), start.toFixed(3));
       return true;
     } catch (err) {
       this.logWarn('[MSE] back-buffer evict failed (%s): %s', mediaType, (err as Error).message);

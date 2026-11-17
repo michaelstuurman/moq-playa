@@ -1586,6 +1586,30 @@ describe('MseMediaSource — live-buffer management', () => {
         expect(vsb.appendedPayloads.length).toBe(appendsBefore + 1); // serialized, then appended
     });
 
+    it('a remove that leaves a frame behind is not repeated on every append', async () => {
+        const { adapter, video, vsb } = await makePlayingAdapter();
+        // Safari kept one 21 ms frame at the start of the removed range: the
+        // buffered start does not move however often the same remove runs.
+        video.currentTime = 13.58;
+        vsb.buffered = makeTimeRanges([[2.091, 2.112], [3.605, 13.611]]);
+        const removesBefore = vsb.removeCalls.length;
+        for (let i = 0; i < 20; i++) {
+            adapter.appendChunk('video', makeSegment({ bmd: 13_611 + i * 20, defaultDur: 20, sampleCount: 1 }), 'track1');
+            await flush();
+            await flush();
+        }
+        const removes = vsb.removeCalls.slice(removesBefore);
+        expect(removes).toHaveLength(1);
+        expect(removes[0]![0]).toBe(0); // from 0: the leftover frame is inside the range
+        // A second later the next remove may run.
+        video.currentTime = 14.6;
+        vsb.buffered = makeTimeRanges([[2.091, 2.112], [3.605, 14.611]]);
+        adapter.appendChunk('video', makeSegment({ bmd: 14_100, defaultDur: 20, sampleCount: 1 }), 'track1');
+        await flush();
+        await flush();
+        expect(vsb.removeCalls.slice(removesBefore)).toHaveLength(2);
+    });
+
     it('does not evict or chase before playTriggered (startup exempt)', async () => {
         const { adapter, video, vsb } = await makeReadyAdapter();
         video.rejectPlay = true; // autoplay blocked → playTriggered stays false
