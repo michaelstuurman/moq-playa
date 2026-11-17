@@ -46,32 +46,21 @@ interface ReceptionHeader {
     readonly payloadLength?: bigint;
     readonly propertiesLength?: number;
 }
-interface ObservableTransport {
+interface ObservableConnection {
     observeObjectReception?: (listener: (event: ReceptionHeader) => void) => () => void;
 }
 
-/**
- * Counts what arrives on each transport a factory makes: payload bytes and
- * distinct data streams. `latest` is the budget of the newest transport.
- */
-export function countingTransports<A extends unknown[], T>(
-    factory: (...args: A) => Promise<T>,
-    onCreated: (budget: SessionBudget) => void,
-): (...args: A) => Promise<T> {
-    return async (...args: A) => {
-        const transport = await factory(...args);
-        const budget: SessionBudget = { bytes: 0, streams: 0 };
-        const seen = new Set<bigint>();
-        const observable = transport as unknown as ObservableTransport;
-        observable.observeObjectReception?.((event) => {
-            if (event.type !== 'header') return;
-            budget.bytes += Number(event.payloadLength ?? 0n) + (event.propertiesLength ?? 0);
-            if (event.streamId != null && !seen.has(event.streamId)) {
-                seen.add(event.streamId);
-                budget.streams++;
-            }
-        });
-        onCreated(budget);
-        return transport;
-    };
+/** Counts payload bytes and distinct data streams that arrive on one MoQT connection. */
+export function countReception(connection: unknown): SessionBudget {
+    const budget: SessionBudget = { bytes: 0, streams: 0 };
+    const seen = new Set<bigint>();
+    (connection as ObservableConnection).observeObjectReception?.((event) => {
+        if (event.type !== 'header') return;
+        budget.bytes += Number(event.payloadLength ?? 0n) + (event.propertiesLength ?? 0);
+        if (event.streamId != null && !seen.has(event.streamId)) {
+            seen.add(event.streamId);
+            budget.streams++;
+        }
+    });
+    return budget;
 }

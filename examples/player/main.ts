@@ -18,7 +18,7 @@
  */
 
 import { LiveEdgeController } from './live-edge.js';
-import { countingTransports, overBudget, rotationLimits, type SessionBudget } from './session-rotation.js';
+import { countReception, overBudget, rotationLimits, type SessionBudget } from './session-rotation.js';
 import { MoqtPlayer, PlayerErrorCode, usesMsePath, buildCatalogSelection } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import { QlogTrace, varint } from '@openmoq/transport';
@@ -316,9 +316,11 @@ function startRotation(p: MoqtPlayer): void {
         rotating = true;
         const at = `${(budget.bytes / 1048576).toFixed(1)} MiB, ${budget.streams} streams`;
         log(`[rotate] new session after ${at}`);
-        p.migrate(new MoqtConnection(draftVersion)).then(() => {
+        const connection = new MoqtConnection(draftVersion);
+        const candidate = countReception(connection);
+        p.migrate(connection).then(() => {
             if (player !== p) return;
-            liveBudget = newestBudget;
+            liveBudget = candidate;
             log('[rotate] moved to the new session');
         }, (err) => {
             // A busy player (quality switch, seek) refuses; try again shortly.
@@ -1468,15 +1470,15 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         // stream's audio codec (Opus in MP4 on Safari's MSE).
         ...(params.get('audio') === 'off' ? { disableAudio: true } : {}),
         ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
-        createTransport: countingTransports(createWebTransport({ signal: transportAbort.signal,
+        createTransport: createWebTransport({ signal: transportAbort.signal,
             ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
-            (budget) => {
-                // Outside a rotation a new transport is the live session (load,
-                // GOAWAY); during one it is the candidate, live once adopted.
-                newestBudget = budget;
-                if (!rotating) liveBudget = budget;
-            }),
-        createConnection: () => new MoqtConnection(draftVersion),
+        createConnection: () => {
+            // The player's own connection (load, GOAWAY migration) is the live one.
+            const connection = new MoqtConnection(draftVersion);
+            newestBudget = countReception(connection);
+            if (!rotating) liveBudget = newestBudget;
+            return connection;
+        },
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
         createRenderer: () => attemptRenderer,

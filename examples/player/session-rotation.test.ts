@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { countingTransports, DEFAULT_LIMITS, isWebKit, overBudget, rotationLimits } from './session-rotation.js';
+import { countReception, DEFAULT_LIMITS, isWebKit, overBudget, rotationLimits } from './session-rotation.js';
 
 const SAFARI_MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Safari/605.1.15';
 const CHROME_MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
@@ -28,16 +28,14 @@ describe('session rotation', () => {
         expect(overBudget({ bytes: 1, streams: 4999 }, DEFAULT_LIMITS)).toBe(false);
     });
 
-    it('counts payload bytes and distinct streams per transport', async () => {
+    it('counts payload bytes and distinct streams on a connection', () => {
         let listener: ((e: object) => void) | undefined;
-        const transport = { observeObjectReception: (l: (e: object) => void) => { listener = l; return () => {}; } };
-        const budgets: { bytes: number; streams: number }[] = [];
-        const make = countingTransports(async () => transport, (b) => budgets.push(b));
-        expect(await make()).toBe(transport);
+        const connection = { observeObjectReception: (l: (e: object) => void) => { listener = l; return () => {}; } };
+        const budget = countReception(connection);
         listener!({ type: 'header', streamId: 1n, payloadLength: 100n, propertiesLength: 4 });
         listener!({ type: 'header', streamId: 1n, payloadLength: 50n, propertiesLength: 0 });
         listener!({ type: 'progress', payloadReceived: 100n });
         listener!({ type: 'header', streamId: 2n, payloadLength: 10n, propertiesLength: 0 });
-        expect(budgets[0]).toEqual({ bytes: 164, streams: 2 });
+        expect(budget).toEqual({ bytes: 164, streams: 2 });
     });
 });

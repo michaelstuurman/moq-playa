@@ -134,7 +134,7 @@ export function fixture(configure?: (p: FakePlayer, index: number) => void) {
     startLiveEdgeController: () => {},
     startRotation: () => {},
     stopRotation: () => {},
-    countingTransports: (factory: unknown) => factory,
+    countReception: () => ({ bytes: 0, streams: 0 }),
     authority: undefined,
     warmStart: false,
     catalogFromUrl: undefined,
