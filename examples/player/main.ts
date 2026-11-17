@@ -272,16 +272,17 @@ const drmSessionCache = new DrmSessionCache();
 // ?msedebug=1 also shows the adapter's [DRM] and [STALL] console lines in the on-page log,
 // for a device without a console (an iPhone). They hold no key material.
 if (params.get('msedebug') === '1') {
-    const mirror = (original: (...args: unknown[]) => void, mark: string) => (...args: unknown[]): void => {
+    const mirror = (original: (...args: unknown[]) => void, mark: string, tags: RegExp) => (...args: unknown[]): void => {
         original(...args);
-        if (typeof args[0] !== 'string' || !/^\[(DRM|STALL)\]/.test(args[0])) return;
+        if (typeof args[0] !== 'string' || !tags.test(args[0])) return;
         let next = 1;
         const text = args[0].replace(/%[sdo]/g, () => String(args[next++]));
         log(mark + [text, ...args.slice(next).map(String)].join(' '));
     };
-    console.log = mirror(console.log.bind(console), '');
+    console.log = mirror(console.log.bind(console), '', /^\[(DRM|STALL)\]/);
     // Warnings too: a failed key session is only ever a warning.
-    console.warn = mirror(console.warn.bind(console), '⚠ ');
+    // MSE warnings too: a refused or dropped append shows there.
+    console.warn = mirror(console.warn.bind(console), '⚠ ', /^\[(DRM|STALL|MSE)\]/);
 }
 
 // ?liveedge=auto or ?liveedge=<ms>: hold the MSE playhead close to the buffered

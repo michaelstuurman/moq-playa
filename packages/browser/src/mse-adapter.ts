@@ -1649,6 +1649,7 @@ export class MseMediaSource implements MediaSourceLike {
   }
 
   private enqueueAppend(mediaType: 'video' | 'audio', entry: AppendEntry): boolean {
+    this.offered[mediaType]++;
     const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
     const bytes = queue.reduce((total, queued) => total + queued.data.byteLength, 0);
     if (queue.length >= this.maxQueuedChunks || entry.data.byteLength > this.maxQueuedBytes - bytes) {
@@ -4570,25 +4571,28 @@ export class MseMediaSource implements MediaSourceLike {
 
   /** Debug: watchdog ticks logged in the current freeze. */
   private stallLogTicks = 0;
+  /** Debug: chunks offered and refused per track. */
+  private readonly offered = { video: 0, audio: 0 };
 
-  /** Debug: the buffered ranges of each SourceBuffer near the playhead, per track. */
+  /** Debug: per track the buffered ranges, the append queue and the last append, at a freeze. */
   private logBufferedAtWait(why: string): void {
     if (!this.debug) return;
     const t = this.video.currentTime;
-    const show = (buffer: SourceBuffer | null): string => {
+    const now = performance.now();
+    const show = (mediaType: 'video' | 'audio'): string => {
+      const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
+      const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
       const r = buffer ? safeBuffered(buffer) : null;
-      if (!r) return 'none';
-      const out: string[] = [];
-      for (let i = 0; i < r.length; i++) {
-        if (r.end(i) < t - 2 || r.start(i) > t + 5) continue;
-        out.push(`${r.start(i).toFixed(3)}-${r.end(i).toFixed(3)}`);
-      }
-      return `${r.length} ranges [${out.join(' ')}]`;
+      const ranges = r ? Array.from({ length: r.length }, (_, i) => `${r.start(i).toFixed(3)}-${r.end(i).toFixed(3)}`).join(' ') : 'none';
+      const last = this.lastAppendWallMs[mediaType];
+      const head = queue[0]?.ranges?.[0];
+      return `[${ranges}] offered=${this.offered[mediaType]} queued=${queue.length}`
+        + `${head ? ` head=${head.startTime}` : ''} updating=${buffer?.updating ?? '-'}`
+        + ` inflight=${this.inFlightOp[mediaType] ? 'yes' : 'no'} gapwait=${this.appendGapWait[mediaType] ? 'yes' : 'no'}`
+        + ` lastAppend=${last === null ? '-' : `${Math.round(now - last)}ms ago`}`;
     };
-    this.logDebug('[STALL] %s t=%s ready=%d video: %s | audio: %s | element: %s', why, t.toFixed(3),
-      this.video.readyState, show(this.videoBuffer), show(this.audioBuffer),
-      Array.from({ length: this.video.buffered.length }, (_, i) =>
-        `${this.video.buffered.start(i).toFixed(3)}-${this.video.buffered.end(i).toFixed(3)}`).join(' '));
+    this.logDebug('[STALL] %s t=%s ready=%d | video %s | audio %s', why, t.toFixed(3),
+      this.video.readyState, show('video'), show('audio'));
   }
 
   private handleWaiting = (): void => {
