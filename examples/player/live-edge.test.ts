@@ -56,8 +56,8 @@ describe('LiveEdgeController', () => {
     it('lowers the target to its minimum on a smooth stream', () => {
         const c = new LiveEdgeController();
         const r = run(c, 120, 50, 0.4);
-        expect(c.targetS).toBeLessThan(0.13);
-        expect(r.ahead).toBeLessThan(0.2);
+        expect(c.targetS).toBeLessThan(0.27);
+        expect(r.ahead).toBeLessThan(0.33);
         expect(r.lowest).toBeGreaterThan(0.03);
     });
 
@@ -65,8 +65,8 @@ describe('LiveEdgeController', () => {
         const c = new LiveEdgeController();
         const r = run(c, 180, 300, 0.4);
         // 300 ms bursts swing the buffer 300 ms; the dip is about half of it.
-        expect(c.targetS).toBeGreaterThan(0.15);
-        expect(c.targetS).toBeLessThan(0.35);
+        expect(c.targetS).toBeGreaterThan(0.24);
+        expect(c.targetS).toBeLessThan(0.45);
         expect(r.lowest).toBeGreaterThan(0.02);
     });
 
@@ -83,11 +83,11 @@ describe('LiveEdgeController', () => {
         const smooth = run(c, 120, 50, 0.4);
         const before = c.targetS;
         c.stalled(smooth.end);
-        expect(c.targetS).toBeCloseTo(before + 0.1, 5);
+        expect(c.targetS).toBeCloseTo(before + 0.25, 5);
         const held = run(c, 25, 50, c.targetS, smooth.end);
-        expect(c.targetS).toBeCloseTo(before + 0.1, 5);
+        expect(c.targetS).toBeCloseTo(before + 0.25, 5);
         run(c, 60, 50, held.ahead, held.end);
-        expect(c.targetS).toBeLessThan(before + 0.05);
+        expect(c.targetS).toBeLessThan(before + 0.1);
     });
 
     it('a fixed target ignores a stall', () => {

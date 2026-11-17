@@ -15,15 +15,17 @@ export interface LiveEdgeStep {
 }
 
 const FLOOR_S = 0.06;
-const MIN_TARGET_S = 0.1;
+// Below about 0.25 s one late burst empties the buffer, and Chrome then waits
+// for a second or more before it plays again: a little delay buys smoothness.
+const MIN_TARGET_S = 0.25;
 const MAX_TARGET_S = 1.5;
-const START_TARGET_S = 0.25;
+const START_TARGET_S = 0.3;
 const WINDOW_MS = 15_000;
 /** Time constant of the average that the rate follows and dips are measured from. */
 const MEAN_S = 2;
 /** How fast the target comes down: seconds of target per second. */
 const LOWER_PER_S = 0.01;
-const STALL_STEP_S = 0.1;
+const STALL_STEP_S = 0.25;
 const STALL_HOLD_MS = 30_000;
 const DEADBAND_S = 0.03;
 /**
