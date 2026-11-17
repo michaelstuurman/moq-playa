@@ -2509,7 +2509,10 @@ export class MseMediaSource implements MediaSourceLike {
     if (!this.drmConfig || !state || this.destroyed) return;
     const live = (): boolean => !this.destroyed && this.keySessions.get(session) === state;
     try {
-      const response = await fetch(this.drmConfig.licenseUrl, {
+      const url = isFairplay(this.drmConfig.keySystem)
+        ? fairplayLicenseUrl(this.drmConfig.licenseUrl, state.initData)
+        : this.drmConfig.licenseUrl;
+      const response = await fetch(url, {
         method: 'POST',
         body: event.message,
         signal: state.abort.signal,
@@ -4653,6 +4656,49 @@ export class MseMediaSource implements MediaSourceLike {
       ),
     );
   };
+}
+
+/**
+ * The KID of FairPlay `sinf` init data, as 32 hex digits. Safari passes the
+ * track's `sinf` box as JSON (`{"sinf": ["<base64>"]}`); raw boxes are read
+ * too. The KID is the `tenc` box's `default_KID`.
+ */
+export function sinfKid(initData: Uint8Array): string | null {
+  let boxes = initData;
+  try {
+    const json = JSON.parse(new TextDecoder().decode(initData)) as { sinf?: unknown };
+    const first = Array.isArray(json.sinf) ? json.sinf[0] : undefined;
+    if (typeof first !== 'string') return null;
+    boxes = Uint8Array.from(atob(first), (c) => c.charCodeAt(0));
+  } catch {
+    // Not JSON: raw boxes.
+  }
+  for (let i = 4; i + 4 <= boxes.byteLength; i++) {
+    if (boxes[i] === 0x74 && boxes[i + 1] === 0x65 && boxes[i + 2] === 0x6e && boxes[i + 3] === 0x63) {
+      const start = i - 4;
+      if (start + 32 > boxes.byteLength) return null;
+      return Array.from(boxes.slice(start + 16, start + 32)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  }
+  return null;
+}
+
+/**
+ * A track's FairPlay license URL: the configured one plus `kid` from the init
+ * data, so a stream with separate video and audio keys gets the license of
+ * each. A URL that names `kid` already, or init data without one, is kept.
+ */
+export function fairplayLicenseUrl(licenseUrl: string, initData: Uint8Array): string {
+  const kid = sinfKid(initData);
+  if (!kid) return licenseUrl;
+  try {
+    const url = new URL(licenseUrl, globalThis.location?.href);
+    if (url.searchParams.has('kid')) return licenseUrl;
+    url.searchParams.set('kid', kid);
+    return url.toString();
+  } catch {
+    return licenseUrl;
+  }
 }
 
 /**
