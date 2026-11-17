@@ -32,7 +32,7 @@ function fixture(fetchCatalog = false) {
     playEpoch: 0, startupDiscovery: null, startupTransport: null, teardownBarrier: new TeardownBarrier(100),
     ensureAudio: () => ({ ctx: {}, clock: {} }), newStartupLatch: () => ({}),
     resolveRelayEndpoint: async () => 'https://test.invalid', log: vi.fn(),
-    namespaceArg: 'live', msfLink: undefined, msfRefusal: undefined, startLiveEdgeController: () => {}, authority: undefined, warmStart: false, catalogFromUrl: undefined, catalogBootstrap: undefined,
+    namespaceArg: 'live', msfLink: undefined, msfRefusal: undefined, startLiveEdgeController: () => {}, startRotation: () => {}, stopRotation: () => {}, countingTransports: (factory: unknown) => factory, authority: undefined, warmStart: false, catalogFromUrl: undefined, catalogBootstrap: undefined,
     certHash: undefined, draftVersion: undefined, CanvasRenderer: class { stop() {} start() {} },
     canvas: { style: {} }, renderer: null, startupSummaryEnabled: false, trace: null,
     createWebTransport: ({ signal }: { signal: AbortSignal }) => async () => {

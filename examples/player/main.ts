@@ -18,6 +18,7 @@
  */
 
 import { LiveEdgeController } from './live-edge.js';
+import { countingTransports, overBudget, rotationLimits, type SessionBudget } from './session-rotation.js';
 import { MoqtPlayer, PlayerErrorCode, usesMsePath, buildCatalogSelection } from '@openmoq/player';
 import { MoqtConnection } from '@openmoq/webtransport';
 import { QlogTrace, varint } from '@openmoq/transport';
@@ -292,6 +293,41 @@ if (params.get('msedebug') === '1') {
 // the stream and goes as low as its arrivals allow (live-edge.ts).
 const liveEdgeParam = params.get('liveedge');
 let liveEdgeTimer: ReturnType<typeof setInterval> | undefined;
+// Session rotation (session-rotation.ts): the budget of the live session and of
+// the newest transport, and the check timer.
+const rotation = rotationLimits(params.get('rotate'), navigator.userAgent);
+let rotationTimer: ReturnType<typeof setInterval> | undefined;
+let liveBudget: SessionBudget | null = null;
+let newestBudget: SessionBudget | null = null;
+let rotating = false;
+let rotationRetryAt = 0;
+function stopRotation(): void {
+    clearInterval(rotationTimer);
+    rotationTimer = undefined;
+}
+function startRotation(p: MoqtPlayer): void {
+    clearInterval(rotationTimer);
+    rotating = false;
+    rotationRetryAt = 0;
+    if (!rotation) return;
+    rotationTimer = setInterval(() => {
+        const budget = liveBudget;
+        if (!budget || rotating || player !== p || Date.now() < rotationRetryAt || !overBudget(budget, rotation)) return;
+        rotating = true;
+        const at = `${(budget.bytes / 1048576).toFixed(1)} MiB, ${budget.streams} streams`;
+        log(`[rotate] new session after ${at}`);
+        p.migrate(new MoqtConnection(draftVersion)).then(() => {
+            if (player !== p) return;
+            liveBudget = newestBudget;
+            log('[rotate] moved to the new session');
+        }, (err) => {
+            // A busy player (quality switch, seek) refuses; try again shortly.
+            rotationRetryAt = Date.now() + 2000;
+            log(`[rotate] not now: ${err instanceof Error ? err.message : String(err)}`);
+        }).finally(() => { rotating = false; });
+    }, 500);
+}
+
 function startLiveEdgeController(): void {
     if (liveEdgeTimer !== undefined || liveEdgeParam === null) return;
     const fixedMs = Number(liveEdgeParam);
@@ -788,6 +824,7 @@ async function stopPlayback(strict = false): Promise<void> {
     startupTransport?.abort(new Error('playback stopped'));
     startupTransport = null;
 
+    stopRotation();
     const p = player;
     const oldExternalConnection = externalConnection;
     player = null;
@@ -1431,8 +1468,14 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         // stream's audio codec (Opus in MP4 on Safari's MSE).
         ...(params.get('audio') === 'off' ? { disableAudio: true } : {}),
         ...(locmafDecoding !== 'mse' ? { locmafDecoding } : {}),
-        createTransport: createWebTransport({ signal: transportAbort.signal,
+        createTransport: countingTransports(createWebTransport({ signal: transportAbort.signal,
             ...(certHash ? { certHash } : {}), ...(draftVersion ? { draftVersion } : {}) }),
+            (budget) => {
+                // Outside a rotation a new transport is the live session (load,
+                // GOAWAY); during one it is the candidate, live once adopted.
+                newestBudget = budget;
+                if (!rotating) liveBudget = budget;
+            }),
         createConnection: () => new MoqtConnection(draftVersion),
         createVideoDecoder: () => new WebCodecsVideoDecoder({ preferSoftwareDecoder }),
         createAudioDecoder: () => new WebCodecsAudioDecoder(),
@@ -1495,6 +1538,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     });
     if (outputSignal?.aborted) transportAbort.abort(outputSignal.reason);
     player = p;
+    startRotation(p);
     let starting = true;
     let startupError: PlaybackStartFailure | undefined;
     let rejectStartup!: (error: PlaybackStartFailure) => void;
