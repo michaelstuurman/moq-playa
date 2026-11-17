@@ -301,6 +301,28 @@ let liveBudget: SessionBudget | null = null;
 let newestBudget: SessionBudget | null = null;
 let rotating = false;
 let rotationRetryAt = 0;
+/** Buffer ahead of the playhead, for the rotation log: "260 ms, ready 4". */
+function bufferNow(): string {
+    const v = document.querySelector('video');
+    if (!v || !v.buffered.length) return 'no buffer';
+    const ahead = v.buffered.end(v.buffered.length - 1) - v.currentTime;
+    return `buffer ${Math.round(ahead * 1000)} ms, ready ${v.readyState}${v.paused ? ', paused' : ''}`;
+}
+/** Logs the buffer every 250 ms for 3 s after a rotation, and the lowest value. */
+function watchBufferAfterRotation(p: MoqtPlayer): void {
+    let lowest = Infinity, ticks = 0;
+    const timer = setInterval(() => {
+        const v = document.querySelector('video');
+        if (player !== p || !v) { clearInterval(timer); return; }
+        const ahead = v.buffered.length ? v.buffered.end(v.buffered.length - 1) - v.currentTime : 0;
+        lowest = Math.min(lowest, ahead);
+        log(`[rotate] +${(++ticks * 0.25).toFixed(2)} s: ${bufferNow()}`);
+        if (ticks >= 12) {
+            clearInterval(timer);
+            log(`[rotate] lowest buffer after the switch: ${Math.round(lowest * 1000)} ms`);
+        }
+    }, 250);
+}
 function stopRotation(): void {
     clearInterval(rotationTimer);
     rotationTimer = undefined;
@@ -315,13 +337,14 @@ function startRotation(p: MoqtPlayer): void {
         if (!budget || rotating || player !== p || Date.now() < rotationRetryAt || !overBudget(budget, rotation)) return;
         rotating = true;
         const at = `${(budget.bytes / 1048576).toFixed(1)} MiB, ${budget.streams} streams`;
-        log(`[rotate] new session after ${at}`);
+        log(`[rotate] new session after ${at}; ${bufferNow()}`);
         const connection = new MoqtConnection(draftVersion);
         const candidate = countReception(connection);
         p.migrate(connection).then(() => {
             if (player !== p) return;
             liveBudget = candidate;
-            log('[rotate] moved to the new session');
+            log(`[rotate] moved to the new session; ${bufferNow()}`);
+            watchBufferAfterRotation(p);
         }, (err) => {
             // A busy player (quality switch, seek) refuses; try again shortly.
             rotationRetryAt = Date.now() + 2000;
