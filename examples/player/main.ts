@@ -346,7 +346,8 @@ function startLiveEdgeController(): void {
         // group start took encodeToReceiptMs to arrive, and the playhead is
         // `ahead` behind the newest media in the buffer ("~").
         const receipt = stats?.videoEncodeObservation?.encodeToReceiptMs;
-        const estimate = typeof shown !== 'number' && typeof receipt === 'number' ? receipt + ahead * 1000 : undefined;
+        let estimate = typeof shown !== 'number' && typeof receipt === 'number' ? receipt + ahead * 1000 : undefined;
+        if (typeof shown !== 'number' && estimate === undefined) estimate = timelineDelayMs(v);
         readout.textContent = `buffer ${Math.round(ahead * 1000)} ms`
             + ` (${controller.auto ? 'auto ' : ''}${state.targetMs})`
             + (typeof shown === 'number' ? ` · delay ${Math.round(shown)} ms`
@@ -377,6 +378,8 @@ interface StartupLatch {
 function newStartupLatch(): StartupLatch {
     return { geometry: null, report: null, emitted: false };
 }
+/** Rebase geometry of the current session, for the readout's delay estimate. */
+let startupGeometry: CmafStartupGeometry | null = null;
 /** Debug-gate for the joined summary; set from ?msedebug=1 at connect time. */
 let startupSummaryEnabled = false;
 /** Emit the joined summary exactly once, only when both halves have landed. */
@@ -1485,7 +1488,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
             // rebase geometry and the adapter's TERMINAL startup report. It
             // emits only when both belong to the same session and startup has
             // actually settled — never from a mid-startup snapshot.
-            asm.onStartupGeometry = (g) => { latch.geometry = g; emitStartupSummary(latch); };
+            asm.onStartupGeometry = (g) => { latch.geometry = g; startupGeometry = g; emitStartupSummary(latch); };
             return asm;
         },
         onQlogEvent: (e) => trace?.record(e),
@@ -1758,4 +1761,27 @@ async function hasKeySystem(keySystem: string): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+/**
+ * Delay from the media timeline: the playhead in media time (through the
+ * startup rebase geometry), the wall clock of the timeline entry at or before
+ * it, and now. An estimate: it assumes the encoder and this machine agree on
+ * the time, and that the MSE timeline has not been rebased since startup.
+ */
+function timelineDelayMs(v: HTMLVideoElement): number | undefined {
+    const g = startupGeometry;
+    const entries = (player as unknown as { mediaTimelineEntries?: readonly { mediaPts: number; wallclockTime: number }[] | null })
+        ?.mediaTimelineEntries;
+    if (!g || !g.videoTimescale || g.videoStartSec === null || !entries?.length) return undefined;
+    let rawMs: number;
+    try { rawMs = Number(BigInt(g.videoRawBmd) * 1000n / BigInt(g.videoTimescale)); } catch { return undefined; }
+    const ptsMs = (v.currentTime - g.videoStartSec) * 1000 + rawMs;
+    for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i]!;
+        if (e.mediaPts > ptsMs || !(e.wallclockTime > 0)) continue;
+        if (ptsMs - e.mediaPts > 5000) return undefined;
+        return Date.now() - (e.wallclockTime + (ptsMs - e.mediaPts));
+    }
+    return undefined;
 }

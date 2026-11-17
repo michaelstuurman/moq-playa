@@ -2408,6 +2408,14 @@ export class MoqtPlayer {
     return this.stateMachine.state;
   }
 
+  /**
+   * Entries of the live media timeline track (MSF §7.1: media PTS in ms, location,
+   * wall clock in ms), read-only; null without a timeline track. Diagnostics only.
+   */
+  get mediaTimelineEntries(): readonly { readonly mediaPts: number; readonly wallclockTime: number }[] | null {
+    return this.timelineState?.entries ?? null;
+  }
+
   /** Accepted/adopted output identities, independent of startup selectors. */
   get selection(): MediaSelectionSnapshot { return this._selection; }
 
