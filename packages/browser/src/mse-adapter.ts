@@ -4588,7 +4588,7 @@ export class MseMediaSource implements MediaSourceLike {
       const head = queue[0]?.ranges?.[0];
       return `[${ranges}] offered=${this.offered[mediaType]} queued=${queue.length}`
         + `${head ? ` head=${head.startTime}` : ''} updating=${buffer?.updating ?? '-'}`
-        + ` inflight=${this.inFlightOp[mediaType] ? 'yes' : 'no'} gapwait=${this.appendGapWait[mediaType] ? 'yes' : 'no'}`
+        + ` inflight=${this.inFlightOp[mediaType] ? `${this.inFlightOp[mediaType]!.cause}#${this.inFlightOp[mediaType]!.id}` : 'no'} gapwait=${this.appendGapWait[mediaType] ? 'yes' : 'no'}`
         + ` lastAppend=${last === null ? '-' : `${Math.round(now - last)}ms ago`}`;
     };
     this.logDebug('[STALL] %s t=%s ready=%d | video %s | audio %s', why, t.toFixed(3),

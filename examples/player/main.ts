@@ -279,7 +279,7 @@ if (params.get('msedebug') === '1') {
         const text = args[0].replace(/%[sdo]/g, () => String(args[next++]));
         log(mark + [text, ...args.slice(next).map(String)].join(' '));
     };
-    console.log = mirror(console.log.bind(console), '', /^\[(DRM|STALL)\]/);
+    console.log = mirror(console.log.bind(console), '', /^\[(DRM|STALL)\]|^\[MSE\] evict/);
     // Warnings too: a failed key session is only ever a warning.
     // MSE warnings too: a refused or dropped append shows there.
     console.warn = mirror(console.warn.bind(console), '⚠ ', /^\[(DRM|STALL|MSE)\]/);
