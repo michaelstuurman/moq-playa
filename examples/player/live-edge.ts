@@ -19,7 +19,7 @@ const FLOOR_S = 0.06;
 // for a second or more before it plays again: a little delay buys smoothness.
 const MIN_TARGET_S = 0.25;
 const MAX_TARGET_S = 1.5;
-const START_TARGET_S = 0.3;
+const START_TARGET_S = 0.25;
 const WINDOW_MS = 15_000;
 /** Time constant of the average that the rate follows and dips are measured from. */
 const MEAN_S = 2;
