@@ -341,9 +341,16 @@ function startLiveEdgeController(): void {
         if (ticks++ % 5 !== 0) return;
         const stats = player?.stats as any;
         const shown = stats?.videoPresentationObservation?.encodeToPresentationMs;
+        // Safari reports no presented frames for FairPlay video, so there is no
+        // presentation observation. Then the delay is estimated: the latest
+        // group start took encodeToReceiptMs to arrive, and the playhead is
+        // `ahead` behind the newest media in the buffer ("~").
+        const receipt = stats?.videoEncodeObservation?.encodeToReceiptMs;
+        const estimate = typeof shown !== 'number' && typeof receipt === 'number' ? receipt + ahead * 1000 : undefined;
         readout.textContent = `buffer ${Math.round(ahead * 1000)} ms`
             + ` (${controller.auto ? 'auto ' : ''}${state.targetMs})`
-            + (typeof shown === 'number' ? ` · delay ${Math.round(shown)} ms` : '')
+            + (typeof shown === 'number' ? ` · delay ${Math.round(shown)} ms`
+                : typeof estimate === 'number' ? ` · delay ~${Math.round(estimate)} ms` : '')
             + ` · ${v.playbackRate.toFixed(2)}x · jumps ${state.jumps}`
             + (typeof stats?.stallCount === 'number' ? ` · stalls ${stats.stallCount}` : '');
     }, 50);
