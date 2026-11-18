@@ -79,7 +79,13 @@ let msfRefusal: string | undefined;
 try { msfLink = readMsfLink(window.location.hash, window.location.search); }
 catch (error) { msfRefusal = (error as Error).message; }
 // A fragment-only change does not load the page again by itself.
-window.addEventListener('hashchange', () => window.location.reload());
+window.addEventListener('hashchange', (event) => {
+    const oldHash = new URL(event.oldURL).hash;
+    const newHash = new URL(event.newURL).hash;
+    const oldMsf = /^#msf:/i.test(oldHash) ? oldHash : '';
+    const newMsf = /^#msf:/i.test(newHash) ? newHash : '';
+    if (oldMsf !== newMsf) window.location.reload();
+});
 
 const namespaceArg: string | readonly string[] = msfLink?.namespace ?? queryNamespaceArg;
 
@@ -113,7 +119,7 @@ const namespaceArg: string | readonly string[] = msfLink?.namespace ?? queryName
     }
 
     function prefillUrlField() {
-        sUrl.value = msfLink?.relayUrl ?? params.get('url') ?? discoveredRelayUrl() ?? '';
+        sUrl.value = params.get('url') ?? discoveredRelayUrl() ?? '';
         if (sUrl.value || modalDiscovery) return;
         modalDiscovery = new AbortController();
         void resolveRelayEndpoint({ signal: modalDiscovery.signal }).then(
@@ -126,9 +132,8 @@ const namespaceArg: string | readonly string[] = msfLink?.namespace ?? queryName
     function populateFields() {
         prefillUrlField();
         sNs.value = msfLink ? msfLink.namespace.join('/') : params.get('ns') ?? 'live';
-        // Shown, not editable: the MSF URL in the page fragment sets these.
+        // Shown, not editable: the MSF URL in the page fragment sets it.
         sNs.disabled = msfLink !== undefined;
-        sUrl.disabled = msfLink?.relayUrl !== undefined;
         sAuthProfile.value = params.get('authProfile') === 'moqx-compat' ? 'moqx-compat' : 'cat4moq';
         sAuthority.value = params.get('authority') ?? '';
         sWarmStart.checked = params.get('warmStart') === '1';
@@ -175,7 +180,7 @@ const namespaceArg: string | readonly string[] = msfLink?.namespace ?? queryName
         const gap = sGap.value.trim();
         const catalogJson = sCatalog.value.trim();
 
-        if (url && !sUrl.disabled) newParams.set('url', url);
+        if (url) newParams.set('url', url);
         if (ns && ns !== 'live' && !sNs.disabled) newParams.set('ns', ns);
         if (sAuthProfile.value !== 'cat4moq') newParams.set('authProfile', sAuthProfile.value);
         if (authorityValue) newParams.set('authority', authorityValue);
@@ -1363,7 +1368,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     let relayUrl: string;
     try {
         log('Discovering relay endpoint...');
-        relayUrl = msfLink?.relayUrl ?? await resolveRelayEndpoint({ signal: discovery.signal });
+        relayUrl = await resolveRelayEndpoint({ signal: discovery.signal });
     } catch (err) {
         if (epoch !== playEpoch) return;         // superseded by Stop
         log(`Endpoint discovery failed: ${(err as Error).message}`);

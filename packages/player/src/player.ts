@@ -36,7 +36,7 @@ import { ReceivedPayloadRate } from './received-payload-rate.js';
  */
 
 import type { ControlMessage, Parameters, DraftVersion } from '@openmoq/transport';
-import { varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus, SessionState } from '@openmoq/transport';
+import { DEFAULT_DRAFT_VERSION, isDraft23, varint, PublishDoneCode, PublishDoneCode18, RequestError, ObjectStatus, SessionState } from '@openmoq/transport';
 import { CatalogBootstrap } from './catalog-bootstrap.js';
 import type { CatalogObjectEvent, PublishDoneReason } from './catalog-bootstrap.js';
 import { MoqtConnectionError } from '@openmoq/webtransport';
@@ -1729,7 +1729,7 @@ export class MoqtPlayer {
     owner.prefixFetch = null;
     if (info && this.activeFetches.get(info.requestId) === info) this.quarantineFetchRequest(info.requestId);
     try {
-      const work = owner.connection.draftVersion === 22 && !owner.prefixStandalone ? owner.connection.cancelFill(owner.requestId)
+      const work = isDraft22(owner.connection.draftVersion) && !owner.prefixStandalone ? owner.connection.cancelFill(owner.requestId)
         : info ? owner.connection.fetchCancel(info.requestId) : undefined;
       void work?.catch(() => {});
     } catch { /* A retired prefix cannot revoke the retained live subscription. */ }
@@ -2348,7 +2348,7 @@ export class MoqtPlayer {
           this.removeVisibilityListenerIfIdle();
           const detail = e.event === 'cmaf_init'
             ? 'CMAF media arriving but no init segment materialized (initData / initTrack / in-band ftyp+moov)'
-            : 'CMAF MediaSource initialized but no frame rendered (init/codec mismatch?)';
+            : 'CMAF MediaSource initialized but no frame rendered (startup buffering, positioning, or decode pending)';
           this.emitError(createPlayerError(
             'fatal', 'catalog', PlayerErrorCode.CMAF_INIT_TIMEOUT,
             `${detail} within ${e.timeoutMs}ms`,
@@ -8911,7 +8911,7 @@ export class MoqtPlayer {
   /** Draft-aware FETCH INVALID_RANGE code: d14 uses 0x5 (§9.18); 16/18 use
    *  the common table's 0x11. */
   private invalidRangeCode(draftVersion?: DraftVersion): bigint {
-    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
+    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION;
     return draft === 14 ? 0x5n : 0x11n;
   }
 
@@ -9237,7 +9237,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 22,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION) as DraftVersion,
       strict: this.strictCatalogMode(),
     });
 
@@ -9689,7 +9689,7 @@ export class MoqtPlayer {
       },
       log: (msg, ...args) => this.log.debug(msg, ...args),
     }, {
-      draft: (conn.draftVersion ?? this.config.draftVersion ?? 16) as 14 | 16 | 18 | 22,
+      draft: (conn.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION) as DraftVersion,
       // Legacy catalog mode (the explicit 'subscribe' compatibility option):
       // the candidate is a fresh AbsoluteStart subscribe — subscription-only
       // retrieval, ready on the first acceptable base; NEVER a Joining FETCH.
@@ -10119,12 +10119,14 @@ export class MoqtPlayer {
     // actual draft can diverge from configuration under auto-negotiation. An
     // explicit version is passed when the DELIVERING session is not the live
     // one, as during a cross-draft handover.
-    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? 16;
+    const draft = draftVersion ?? this.connection?.draftVersion ?? this.config.draftVersion ?? DEFAULT_DRAFT_VERSION;
     if (code === 0x2n) return 'ended';                            // TRACK_ENDED
     if (code === 0x3n && !isDraft22(draft)) return 'ended';            // SUBSCRIPTION_ENDED (gone in draft 22)
     if (code === 0x4n) return 'going-away';                       // GOING_AWAY
     if (code === 0x1n) return 'fatal-track';                      // UNAUTHORIZED
     if (draft === 14 && code === 0x7n) return 'fatal-track';      // d14 MALFORMED_TRACK
+    // d23 EXPIRED_AUTH_TOKEN (§12.4): retrying with the same token cannot help.
+    if (isDraft23(draft) && code === 0x7n) return 'fatal-track';
     if (draft !== 14 && code === 0x12n) return 'fatal-track';     // d16+ MALFORMED_TRACK
     // INTERNAL_ERROR(0x0), EXPIRED/TOO_FAR_BEHIND (0x5/0x6, either draft
     // orientation), UPDATE_FAILED(0x8), d18/22 EXCESSIVE_LOAD(0x9), unknown.
@@ -10324,7 +10326,7 @@ export class MoqtPlayer {
     if ((!this.config.liveJumpThresholdMs && (this.config.maxCatchUpRate ?? 1) <= 1) || this._destroyed || this.state !== PlayerState.PLAYING || this.playbackIntent !== true
         || this.activeLocSeek || this.activeMseSeek || this.seekIsPreparing() || this.pendingVideoSwitch || this.switchInProgress
         || this.mediaSelection || this.currentMigration || this.pendingRetypes.size
-        || this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange') {
+        || this.hasCallerRange()) {
       this.livePlaybackOwner = null; return null;
     }
     if (this.livePlaybackOwner?.current()) return this.livePlaybackOwner;
@@ -10356,9 +10358,18 @@ export class MoqtPlayer {
         if (rate === 1 || this.livePlaybackRecord()?.output === output) loc?.setPlaybackRate(rate); },
     };
     const tracks = roles.map(role => this.subscribedTrack(role)!);
-    const floorUs = Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
+    const floorUs = this.liveBufferTargetUs(tracks);
     const target = this.config.targetLatencyMs ?? tracks.find(track => track.targetLatency !== undefined)?.targetLatency;
     return this.livePlaybackOwner = { current, output, floorUs, targetUs: target === undefined ? undefined : target * 1000, newest: new Map(), since: null };
+  }
+
+  private hasCallerRange(): boolean {
+    return this.config.subscriptionFilter?.type === 'AbsoluteStart' || this.config.subscriptionFilter?.type === 'AbsoluteRange';
+  }
+
+  private liveBufferTargetUs(tracks: readonly CatalogTrack[]): number {
+    // MSF-01 §5.2.8/§5.2.9 permit a player default; share it with startup.
+    return Math.max(...tracks.map(track => Math.max(track.buffers?.min ?? track.buffers?.target ?? 500, track.buffers?.target ?? 0))) * 1000;
   }
 
   private checkLiveJump(): void {
@@ -17261,6 +17272,10 @@ export class MoqtPlayer {
     return {
       onSegment: (mediaType: 'video' | 'audio', segment: Uint8Array, segTrackName: string, groupId: bigint, inputs?: readonly (object | undefined)[], sourceKey?: string) => {
         if (this._destroyed || this.mediaSource !== ms || !isCurrent()) return;
+        const tracks = (['video', 'audio'] as const).filter(role => this._selection[role] !== null)
+          .map(role => this.subscribedTrack(role));
+        ms.setLiveStartupCushion?.(!this.hasCallerRange() && tracks.length > 0 && tracks.every((track): track is CatalogTrack => track?.isLive === true)
+          ? this.liveBufferTargetUs(tracks) : null);
         const observation = this.observeCmafAppend(ms, inputs);
         if (this._destroyed || this.mediaSource !== ms || !isCurrent()) { observation?.discard('decoder reset'); return; }
         if (resetOffsets && !timestampOffsetSet[mediaType]) {

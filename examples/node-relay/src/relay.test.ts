@@ -137,9 +137,10 @@ function subgroupHeader(alias: bigint, groupId: bigint, subgroupId = 0n): Subgro
 async function acceptPublisher(relay: Relay, publish: IncomingPublish): Promise<void> {
   const owner = { isPublishInitiated: true, isTerminated: false,
     trackNamespace: publish.trackNamespace, trackName: publish.trackName, trackAlias: publish.trackAlias };
-  const conn = { observeObjectReception: () => () => {}, objectReceptionFor: () => undefined, observeObjectReceipts: () => () => {}, objectReceiptFor: () => undefined, acceptSubscribe: vi.fn(async () => undefined), session: {
+  const conn = { transportInfo: null, observeObjectReception: () => () => {}, objectReceptionFor: () => undefined, observeObjectReceipts: () => () => {}, objectReceiptFor: () => undefined, acceptSubscribe: vi.fn(async () => undefined), session: {
     state: 'established', getIncomingSubscription: (id: bigint) => id === publish.requestId ? owner : undefined,
   } } as unknown as MoqtConnection;
+  relay.setupConnection(conn);
   await relay.handlePublish(conn, publish);
 }
 
@@ -253,7 +254,7 @@ describe('Relay subgroup lifecycle', () => {
     expect(sub.close).not.toHaveBeenCalled();
   });
 
-  it.each([18, 22] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
+  it.each([18, 22, 23] as const)('draft %s cancellation resets unfinished relay output instead of sending FIN', async (draft) => {
     const { a, b } = createLoopback();
     const client = new MoqtConnection(draft);
     const server = new MoqtConnection(draft, { role: 'server' });
@@ -263,6 +264,7 @@ describe('Relay subgroup lifecycle', () => {
     server.onSubscribe = (requestId, namespace, name) => { void relay.handleSubscribe(server, requestId, namespace, name); };
     server.onSubscribeClosed = (requestId) => relay.removeSubscription(server, requestId);
     try {
+      relay.setupConnection(server);
       await Promise.all([client.connect(a), server.connect(b)]);
       const subscription = await client.subscribeTrack(nsBytes(DEMO_NAMESPACE), te(DEMO_TRACK));
       const publish = incomingPublish();

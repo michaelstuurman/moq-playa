@@ -224,16 +224,14 @@ describe('demo selection configuration and event ownership', () => {
     expect(f.context.catalogSelection).toBeNull();
     expect(f.context.buildTrackSelector).not.toHaveBeenCalled();
   });
-  it('configures the player from an MSF link without discovering an endpoint', async () => {
+  it('configures the player from an MSF link', async () => {
     const f = fixture();
     const authorization = { getTokens: () => [] };
-    f.context.resolveRelayEndpoint = vi.fn();
-    f.context.msfLink = { namespace: ['live'], catalogTrackName: 'catalog-v2', relayUrl: 'https://msf.invalid/moq', authorization, notes: [] };
+    f.context.msfLink = { namespace: ['live'], catalogTrackName: 'catalog-v2', authorization, notes: [] };
     await f.context.startPlayback();
-    expect(f.instances[0]!.options).toMatchObject({ url: 'https://msf.invalid/moq', catalogTrackName: 'catalog-v2', authorization });
-    expect(f.context.resolveRelayEndpoint).not.toHaveBeenCalled();
+    expect(f.instances[0]!.options).toMatchObject({ url: 'https://test.invalid', catalogTrackName: 'catalog-v2', authorization });
   });
-  it('leaves the relay to discovery for a fragment-only MSF link, and sets nothing without one', async () => {
+  it('sets no authorization without a token, and nothing without an MSF link', async () => {
     const f = fixture();
     f.context.msfLink = { namespace: ['live'], catalogTrackName: 'catalog', notes: [] };
     await f.context.startPlayback();

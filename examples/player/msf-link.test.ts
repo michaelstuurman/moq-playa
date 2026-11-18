@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { formatMsfFragment } from '@openmoq/msf';
 import { readMsfLink } from './msf-link.js';
 
 const ctx = { operation: 'SETUP' as const, draftVersion: 16 as const, relayUrl: 'https://relay.test/moq', signal: new AbortController().signal };
@@ -10,17 +9,10 @@ describe('player MSF link', () => {
   });
 
   it('takes namespace and track from the fragment and leaves the relay to ?url=', () => {
-    expect(readMsfLink('#msf:hypersolid-drm.2dtest--catalog', '?url=https://relay.test/moq&v=16')).toEqual({
-      namespace: ['hypersolid', 'drm-test'], catalogTrackName: 'catalog', notes: [],
+    expect(readMsfLink('#msf:live-demo.2dtest--catalog', '?url=https://relay.test/moq&v=16')).toEqual({
+      namespace: ['live', 'demo-test'], catalogTrackName: 'catalog', notes: [],
     });
     expect(readMsfLink('msf:live--catalog.2dv2', '')).toEqual({ namespace: ['live'], catalogTrackName: 'catalog-v2', notes: [] });
-  });
-
-  it('takes the relay from a whole MSF URL, keeping its server query and dropping the fragment', () => {
-    const link = readMsfLink('#moqt://relay.test:4433/moq?tenant=a#msf:live--catalog&connection=wt&c4m=AAH-_w', '?v=16')!;
-    expect(link.relayUrl).toBe('https://relay.test:4433/moq?tenant=a');
-    expect(link.namespace).toEqual(['live']);
-    expect(link.authorization).toBeDefined();
   });
 
   it.each([[undefined, 1n], ['cat4moq', 1n], ['moqx-compat', 16n]] as const)('presents c4m with ?authProfile=%s and preserves opaque bytes', async (profile, tokenType) => {
@@ -38,18 +30,15 @@ describe('player MSF link', () => {
 
   it('reads the page\'s own license parameter, percent-decoded', () => {
     const licenseUrl = 'https://drm.test/license?token=a+b&x=%20';
-    const hash = `#${formatMsfFragment({ namespace: ['live'], trackName: 'catalog', parameters: [{ name: 'license', value: encodeURIComponent(licenseUrl) }] })}`;
-    expect(hash).not.toContain('?');
+    const hash = `#msf:live--catalog&license=${encodeURIComponent(licenseUrl)}`;
+    expect(hash.slice(1)).not.toContain('?');
     expect(readMsfLink(hash, '')).toEqual({ namespace: ['live'], catalogTrackName: 'catalog', licenseUrl, notes: [] });
   });
 
   it('reads the FairPlay license and certificate parameters', () => {
     const fairplayUrl = 'https://drm.test/fairplay/license?token=a';
     const fpsCertUrl = 'https://drm.test/fairplay/certificate';
-    const hash = `#${formatMsfFragment({ namespace: ['live'], trackName: 'catalog', parameters: [
-      { name: 'fairplay', value: encodeURIComponent(fairplayUrl) },
-      { name: 'fpscert', value: encodeURIComponent(fpsCertUrl) },
-    ] })}`;
+    const hash = `#msf:live--catalog&fairplay=${encodeURIComponent(fairplayUrl)}&fpscert=${encodeURIComponent(fpsCertUrl)}`;
     expect(readMsfLink(hash, '')).toEqual({ namespace: ['live'], catalogTrackName: 'catalog', fairplayUrl, fpsCertUrl, notes: [] });
     expect(() => readMsfLink(hash, '?fairplay=x')).toThrow('?fairplay=');
     expect(() => readMsfLink('#msf:live--catalog&fpscert=nope', '')).toThrow(/^MSF URL fpscert parameter must be/);
@@ -63,40 +52,46 @@ describe('player MSF link', () => {
     expect(message).not.toMatch(/test|alert|zz/);
   });
 
-  it('refuses a required native QUIC connection', () => {
+  it('counts the license parameters apart from what it ignores', () => {
+    const link = readMsfLink(`#msf:live--catalog&license=${encodeURIComponent('https://drm.test/l')}&other=1`, '')!;
+    expect(link.notes).toEqual(['1 parameter is not supported by this page and ignored']);
+  });
+
+  it('refuses a required native QUIC connection and accepts WebTransport', () => {
     expect(() => readMsfLink('#msf:live--catalog&connection=q', '')).toThrow('native QUIC');
-    expect(() => readMsfLink('#moqt://relay.test/moq#msf:live--catalog&connection=q', '')).toThrow('native QUIC');
+    expect(readMsfLink('#msf:live--catalog&connection=wt', '')).toBeDefined();
+    expect(() => readMsfLink('#msf:live--catalog&%63onnection=q', '')).toThrow('native QUIC');
   });
 
   it.each([
-    ['#msf:live--catalog', '?ns=live', '?ns='],
-    ['#msf:live--catalog', '?ns=', '?ns='],
-    ['#msf:live--catalog', '?nsField=live', '?nsField='],
-    ['#moqt://relay.test/moq#msf:live--catalog', '?url=https://relay.test/moq', '?url='],
-    ['#msf:live--catalog&license=https%3A%2F%2Fdrm.test%2F', '?license=https://drm.test/', '?license='],
     ['#msf:live--catalog&c4m=YWJj', '?fetchCatalog=1', '?fetchCatalog=1'],
   ])('refuses %j together with %j', (hash, search, message) => {
     expect(() => readMsfLink(hash, search)).toThrow(message);
   });
 
-  it('allows ?url=, ?license= and ?fetchCatalog=1 where the MSF URL does not set the same thing', () => {
-    expect(readMsfLink('#msf:live--catalog', '?url=https://relay.test/moq&license=https://drm.test/&fetchCatalog=1')).toBeDefined();
-    expect(readMsfLink('#moqt://relay.test/moq#msf:live--catalog', '?url=')).toBeDefined();
+  it('allows ?url= and ?fetchCatalog=1 where the fragment does not set the same thing', () => {
+    expect(readMsfLink('#msf:live--catalog', '?url=https://relay.test/moq&fetchCatalog=1')).toBeDefined();
   });
 
-  it.each(['#msf:', '#msf:live', '#MSF:live--catalog', '#msf:live--catalog&c4m=%%%', '#msf:live--catalog&c4m=YQ&c4m=YQ',
-    '#moqt://#msf:live--catalog', '#moqt://relay.test/moq', '#MOQT:relay.test#msf:live--catalog'])('refuses the malformed MSF URL %j', hash => {
+  it.each(['#msf:', '#msf:live', '#MSF:live--catalog', '#msf:live--catalog&c4m=%%%', '#msf:live--catalog&c4m=YQ&c4m=YQ'])('refuses the malformed MSF fragment %j', hash => {
     expect(() => readMsfLink(hash, '')).toThrow(/^MSF /);
   });
 
-  it('notes what it does not act on by name only', () => {
-    const link = readMsfLink('#msf:live--catalog&location-range=34-64&mediatime-range=0-5&wallclock-range=7&secret=hunter2&other=1', '')!;
-    expect(link.notes).toEqual([
-      'wallclock-range is not supported by this page and is ignored',
-      'mediatime-range is not supported by this page and is ignored',
-      'location-range is not supported by this page and is ignored',
-      '2 unrecognized parameters are ignored',
-    ]);
-    expect(readMsfLink('#msf:live--catalog&x=1', '')!.notes).toEqual(['1 unrecognized parameter is ignored']);
+  it('counts what it does not act on, without names or values', () => {
+    const link = readMsfLink('#msf:live--catalog&unknown=34-64&secret=hunter2&other=1', '')!;
+    expect(link.notes).toEqual(['3 parameters are not supported by this page and ignored']);
+    expect(readMsfLink('#msf:live--catalog&x=1', '')!.notes).toEqual(['1 parameter is not supported by this page and ignored']);
+  });
+});
+
+it.each(['wallclock-range', 'mediatime-range', 'location-range', '%6cocation-range'])('refuses unsupported %s links without exposing values', name => {
+  expect(() => readMsfLink(`#msf:live--catalog&${name}=1-2&${name}=3-4&c4m=YWJj`, ''))
+    .toThrow('MSF URL ranges are not supported by this page');
+});
+
+it.each(['x=%ff', '%ff=1', 'x=%c3'])('accepts a link with one ignored non-UTF-8 parameter: %s', parameter => {
+  expect(readMsfLink(`#msf:live--catalog&${parameter}`, '')).toEqual({
+    namespace: ['live'], catalogTrackName: 'catalog',
+    notes: ['1 parameter is not supported by this page and ignored'],
   });
 });
