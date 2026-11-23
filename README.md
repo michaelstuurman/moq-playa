@@ -432,6 +432,7 @@ object; the higher-level `Player` instead emits `severity`, `code` and `message`
 - **draft-ietf-moq-transport-18** — uni control-stream pair + per-request bidi streams (`draftVersion: 18` / `moqt-18`)
 - **draft-ietf-moq-transport-16** — default supported transport draft
 - **draft-ietf-moq-transport-14** — Red5/moq-rs interop (`draftVersion: 14`)
+- **draft-ietf-moq-msf-02** — Catalog parsing and validation, ordered add/remove/clone/update deltas, render-group dependencies, and uppercase event/SAP timeline indexes. Parsed catalogs and states retain `msfDraft: 'draft-02'`; earlier drafts retain their existing rules.
 - **draft-ietf-moq-msf-00** — Catalog, track selection, ABR (`altGroup`), timeline
 - **draft-ietf-moq-msf-01** - Independent catalogs, op-array deltas and referenced initialization data; catalog bootstrap uses Joining FETCH on drafts 14/16/18 and fills on drafts 22/23
 - **draft-ietf-moq-loc-05** — Low Overhead Container, LOC-04 plus the Codec String property (0x11); `locVersion: 5` to emit
@@ -588,7 +589,6 @@ Example pages:
 | `/connect/` | Protocol explorer — raw message log |
 | `/catalog/` | Catalog browser |
 | `/broadcast/` | Camera/screen publisher example with opt-in CAT4MOQ |
-| `/video/` | Video-only player |
 
 The `/player/` page takes URL parameters: `?url=` (relay), `?ns=` / `?nsField=`
 (namespace), `?hash=` (cert hash), `?v=14|16|18|22|23` (draft), `?authority=`
@@ -661,15 +661,15 @@ instead of Google Chrome.
 
 ## Docs
 
-- [Simulation](docs/simulation.md) — Deterministic protocol-confidence harness (golden vectors, codec property tests, seeded scenario runner) for MoQT drafts 14/16/18
+- [Simulation](docs/simulation.md) — Deterministic protocol-confidence harness: golden vectors, codec property tests, parser crash fuzzing and a seeded scenario runner
 - [Catalog Testing](docs/catalog-testing.md) — Integration harness for validating catalog subscription against a live relay
 - [Authorization](docs/authorization.md) — CAT4MOQ credential providers for players and connections
-- [Package Compatibility](docs/package-compatibility.md) - Legacy package re-exports and release ordering
-- [Draft Development](docs/draft-development.md) - Draft-22 and draft-23 support and compatibility policy
-- [Playout Trace](docs/playout-trace.md) - Bounded qlog recorder, event design and instrumentation status
-- [Optional Player Diagnostics](packages/devtools/PLAYER.md) - Explicit development or production exposure, bounded capture, and recording
-- [Diagnostic Probe](packages/devtools-probe/PROBE.md) - Owner-local WebTransport probes, protocol policy, and lifecycle
-- [DevTools Extension](tools/devtools-extension/README.md) - Build and load the workspace Chrome panel; inspect an opted-in player or start a separate Probe
+- [Package Compatibility](docs/package-compatibility.md) — The legacy `@moqt/*` and `@playa/player` packages
+- [Draft Development](docs/draft-development.md) — Draft-22 and draft-23 support and compatibility policy
+- [Playout Trace](docs/playout-trace.md) — Bounded qlog recorder for support traces
+- [Optional Player Diagnostics](packages/devtools/PLAYER.md) — Explicit development or production exposure, bounded capture, and recording
+- [Diagnostic Probe](packages/devtools-probe/PROBE.md) — Owner-local WebTransport probes, protocol policy, and lifecycle
+- [DevTools Extension](tools/devtools-extension/README.md) — Build and load the workspace Chrome panel; inspect an opted-in player or start a separate Probe
 
 ---
 
@@ -701,6 +701,44 @@ REQUEST_OK has been applied and returns a private copy of its parameters.
 update, and a late acknowledgement can still apply. Draft 14 has no confirmation.
 `IncomingPublish.largestLocation` reports a frozen receive-head snapshot; `closed`
 resolves with the final snapshot when the publication ends.
+
+## MSF-02 catalog limits
+
+`@openmoq/msf` accepts MSF-02 catalogs and the CMSF track extensions. New metadata
+includes `accessibleWindowTime`, `keyframeSpacing`, recognized `packagingMetadata`
+parameters, `encryptionScheme`, and opaque `authInfo`. `resolveTrackDependencies`
+returns direct dependencies with their full namespace identities; pass the
+catalog's draft to enable render-group and catalog-wide name resolution.
+`resolveDependencies` also accepts this draft option for recursive dependencies.
+The compatibility packages re-export the same APIs.
+
+Selection reports catalog references, encrypted tracks, unresolved naming variables,
+and unsupported packaging as exclusions. Catalog references are not followed;
+publish tracks are metadata only. Authorization metadata is not presented automatically.
+The catalog parser accepts uncompressed UTF-8 JSON. The player honors compression
+property `0x78` for MSF-02, MSF-01, and CMSF-01 catalogs and timelines, accepting
+uncompressed and GZIP payloads. Each decompressed object is limited to 8 MiB; pending
+preparation holds input by reference and is bounded to 256 objects, without an input-byte limit. Unsupported compression
+is refused. MSF-00 and catalogformat-01 do not use this signal. MSF-02 event and SAP
+events include optional raw `header` bytes from track property `0x7B`.
+Draft-02 automatic and manual quality switches refuse dissimilar `keyframeSpacing`
+(including a declaration on only one track), report a warning and
+`quality_switch_failed` error, and keep the current track. Equal spacing and two
+absent declarations retain the existing switch. Seamless switching across different
+spacings remains unsupported. A draft-02 update that changes a playing track's codec,
+packaging, initialization, role, alternate/render group or keyframe spacing retires
+the current presentation and reselects through fresh output factories and subscriptions.
+This can interrupt playback; it does not promise a seamless cut or preserve an active
+seek. Playback intent and configured selection constraints remain in force. Pending
+switches and superseded subscriptions are cancelled; subscription preparation is bounded
+by `connectionTimeoutMs`. Other field updates, including bitrate, change catalog state
+without restarting playback. MSF-01 still rejects the `update` operation.
+MSF-02 seeks use resolved dependency identities (including render groups) and floor
+rounding. Indexed retrieval refuses targets outside the most restrictive selected track’s
+`accessibleWindowTime`; wallclock thresholds use UTC milliseconds, and zero-wallclock
+indexes use media time relative to their newest entry. These catalogs
+therefore do not imply complete MSF-02 playback support. Live LOC subscriptions can
+use initialization signaled by an MSF-02 `track-property` init reference.
 
 ## License
 

@@ -9,8 +9,6 @@
  *
  * Browser adapters handle: WebCodecs decode, Canvas rendering, audio scheduling.
  *
- * Compare with ../video/main.ts (588 lines of manual wiring).
- *
  * @see draft-ietf-moq-transport-16 §3 (Session)
  * @see draft-ietf-moq-msf-00 §5 (Catalog)
  * @see draft-ietf-moq-loc-01 §2.1 (video bitstream → VideoDecoder)
@@ -1436,7 +1434,7 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
     // §16): reconstructed into CMAF chunks for MSE (default), or sliced into
     // coded frames for the WebCodecs decoders, the same sink LOC tracks use.
     const locmafDecoding = pickParam('locmaf', ['mse', 'frame'] as const, 'mse');
-    // DIAGNOSTIC: `legacy` restores pre-RED5DEV-2315 per-track zero-basing, which
+    // DIAGNOSTIC: `legacy` restores the earlier per-track zero-basing, which
     // maps both tracks to 0 and erases the publisher's real A/V offset. It is
     // knowingly incorrect and exists only to compare startup geometry in one
     // build. Production is always `shared`.

@@ -43,6 +43,7 @@
  * @module
  */
 
+import { MsfPayloadQueue } from './msf-payload.js';
 import { isDraft22, type DraftVersion } from '@openmoq/transport';
 import type { DataStreamTerminal } from '@openmoq/webtransport';
 import type { CatalogState } from '@openmoq/msf';
@@ -71,6 +72,7 @@ export interface CatalogObjectEvent {
   readonly location: { readonly group: bigint; readonly object: bigint };
   readonly kind: 'payload' | 'gap';
   readonly payload?: Uint8Array;
+  readonly prepare?: () => Uint8Array | Promise<Uint8Array>;
   /** Status-aware gap classification: Object-Does-Not-Exist vs EOR/EOG/EOT
    *  terminators. Only a MISSING status can mean "missing base"; a terminator
    *  is range accounting and never blocks anything. */
@@ -145,6 +147,8 @@ function classify(payload: Uint8Array): Classified {
     if (obj['deltaUpdate'] !== undefined) return { kind: 'msf-delta' };
     if ('streamingFormat' in obj) return { kind: 'independent', profile: 'cf01' };
     if (typeof obj['version'] === 'number') return { kind: 'independent', profile: 'msf00' };
+    // MSF-02 §5 retains the MSF-01 group-head and Joining FETCH rules.
+    if (obj['version'] === 'draft-02') return { kind: 'independent', profile: 'msf01' };
     if (typeof obj['version'] === 'string') return { kind: 'independent', profile: 'msf01' };
   }
   return { kind: 'independent', profile: 'unknown' };
@@ -187,6 +191,7 @@ export class CatalogBootstrap {
 
   /** SUBSCRIBE_OK largest location; null = explicitly none (empty track);
    *  undefined = not yet known. */
+  private readonly payloads = new MsfPayloadQueue();
   private largest: { group: bigint; object: bigint } | null | undefined = undefined;
   private joinRefusedBeforeSubscribeOk = false;
 
@@ -316,12 +321,24 @@ export class CatalogBootstrap {
     this.onFetchError(attempt.id, 'invalid-range');
   }
 
+  private prepareObject(event: CatalogObjectEvent, consume: (event: CatalogObjectEvent) => void, current: () => boolean): boolean {
+    if (!event.prepare) return this.payloads.defer(() => consume(event));
+    const { prepare, ...plain } = event;
+    this.payloads.run(prepare, payload => consume({ ...plain, payload }), error => {
+      const reason = `${event.location.group}:${event.location.object}: ${error.message}`;
+      if (this.cb.currentState() === null) this.fatal(reason);
+      else { this.deltaChainPoisoned = true; this.cb.onDegraded(reason); }
+    }, () => !this.inert() && current());
+    return true;
+  }
+
   // ─── FETCH side (attempt-token-guarded) ───────────────────────────
 
   onFetchObject(attemptId: number, event: CatalogObjectEvent): void {
     if (this.inert()) return;
     const attempt = this.attempt;
     if (!attempt || attempt.id !== attemptId || attempt.cancelled) return; // retired attempt
+    if (this.prepareObject(event, e => this.onFetchObject(attemptId, e), () => this.attempt === attempt && !attempt.cancelled)) return;
     this.bumpInactivity();
 
     // Ordering: ascending over payloads, non-decreasing at marker→payload
@@ -360,6 +377,7 @@ export class CatalogBootstrap {
   }
 
   onFetchStreamClosed(attemptId: number, clean: boolean): void {
+    if (this.payloads.defer(() => this.onFetchStreamClosed(attemptId, clean))) return;
     if (this.inert()) return;
     const attempt = this.attempt;
     if (!attempt || attempt.id !== attemptId || attempt.cancelled) return;
@@ -415,6 +433,7 @@ export class CatalogBootstrap {
 
   onLiveCatalogObject(event: CatalogObjectEvent, streamId: bigint): void {
     if (this.inert()) return;
+    if (this.prepareObject(event, e => this.onLiveCatalogObject(e, streamId), () => true)) return;
     this.bumpInactivity();
     if (event.kind === 'gap') return; // accounting only on the live side too
     if (this.joinRefusedBeforeSubscribeOk && this._phase === 'await-first-payload') {
@@ -486,6 +505,7 @@ export class CatalogBootstrap {
   }
 
   onLiveStreamEvent(streamId: bigint, kind: 'header' | DataStreamTerminal): void {
+    if (kind !== 'header' && this.payloads.defer(() => this.onLiveStreamEvent(streamId, kind))) return;
     if (this.inert()) return;
     // Clean-FIN evidence exists for the retained chain, i.e. for streams that
     // contributed SUFFIX entries. In the live steady state nothing is buffered,
@@ -524,6 +544,7 @@ export class CatalogBootstrap {
   }
 
   onSubscriptionDrained(): void {
+    if (this.payloads.defer(() => this.onSubscriptionDrained())) return;
     if (this.inert()) return;
     this.drained = true;
     if (this.doneReason === null) return;
