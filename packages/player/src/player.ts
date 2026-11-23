@@ -524,6 +524,13 @@ interface MigrationTxn {
     | undefined;
 }
 
+/** GOAWAY migration tries, and the base delay between them (grows linearly). */
+const GOAWAY_MIGRATION_ATTEMPTS = 5;
+const GOAWAY_MIGRATION_RETRY_MS = 300;
+/** Replacement failures that mean the catalog is not on the new relay yet (retried),
+ *  as opposed to a catalog that is there and rejected (reported at once). */
+const GOAWAY_CATALOG_NOT_YET = /catalog bootstrap failed: .*(not retrievable|does not exist|not found|no such)/i;
+
 /** A source-bound handover intent also owns terminal evidence while media settles. */
 type PendingGoaway = Pick<MigrationTxn, 'oldTerminal'> & {
   readonly uri: string;
@@ -8659,8 +8666,9 @@ export class MoqtPlayer {
    * attempted — so a queued/aborted GOAWAY leaks nothing. Failures are surfaced
    * through the error channel rather than left as an unhandled rejection.
    */
-  private startGoawayMigration(uri: string, pending?: PendingGoaway): void {
+  private startGoawayMigration(uri: string, pending?: PendingGoaway, attempt = 1): void {
     if (this._destroyed || this.isTerminalState() || !this.config.createConnection) return;
+    const sourceConnection = this.connection;
     // The URI is peer-controlled text — validate BEFORE creating any candidate
     // connection or transport. A non-empty invalid URI must not silently fall
     // back to the current URL (that would reconnect to a relay that just
@@ -8680,6 +8688,23 @@ export class MoqtPlayer {
       const newConnection = this.config.createConnection!();
       await this.migrateToUrl(newConnection, uri, pending);
     })().catch((err) => {
+      // The replacement relay can be reached before the publisher has moved
+      // to it (both follow the same GOAWAY), so its catalog may not exist yet.
+      // While the draining session still serves, try again a few times before
+      // giving up on the migration and falling back to a reconnect. Only a
+      // catalog that is not there yet is retried; any other failure is final.
+      const reason = err instanceof Error ? err.message : String(err);
+      if (attempt < GOAWAY_MIGRATION_ATTEMPTS && GOAWAY_CATALOG_NOT_YET.test(reason) &&
+          !this._destroyed && !this.isTerminalState() &&
+          sourceConnection !== null && this.connection === sourceConnection &&
+          pending?.oldTerminal === undefined) {
+        this.log.warn('[handover] GOAWAY migration attempt %d found no catalog yet, retrying: %s', attempt, reason);
+        setTimeout(() => {
+          if (this.connection !== sourceConnection) return;
+          this.startGoawayMigration(uri, pending, attempt + 1);
+        }, GOAWAY_MIGRATION_RETRY_MS * attempt);
+        return;
+      }
       // Entry/factory failures never acquired a transaction to report this evidence.
       if (pending) this.reportHeldOldTerminal(pending);
       this.emitError(createPlayerError(
