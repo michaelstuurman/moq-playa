@@ -4308,6 +4308,57 @@ describe('MseMediaSource DRM lifecycle', () => {
             return { ...env, cache, fetchLicense, encryptedKid, license, connect };
         }
 
+        describe('prelicense (key rotation)', () => {
+            const drm = { licenseUrl: 'https://license.example.invalid/' };
+
+            it('licenses an announced key ahead, and the content that needs it reuses the session', async () => {
+                const { cache, sessions, message, fetchLicense, encryptedKid } = cached();
+                await settle(); // MediaKeys of the partition exist once an adapter set them up.
+                const done = cache.prelicense(drm, 'cenc', pssh(0xc));
+                await settle();
+                const session = sessions.at(-1)!;
+                expect(session.generateRequest).toHaveBeenCalledWith('cenc', pssh(0xc));
+                message(session);
+                await settle();
+                session.setStatus(0xc, 'usable');
+                await expect(done).resolves.toBe(true);
+                expect(fetchLicense).toHaveBeenCalledTimes(1);
+                // Already covered: no second license.
+                await expect(cache.prelicense(drm, 'cenc', pssh(0xc))).resolves.toBe(true);
+                const count = sessions.length;
+                await encryptedKid(0xc);
+                expect(sessions).toHaveLength(count);
+                expect(fetchLicense).toHaveBeenCalledTimes(1);
+                cache.close();
+            });
+
+            it('skips FairPlay, foreign partitions and initialization without key IDs', async () => {
+                const { cache, sessions } = cached();
+                await settle();
+                const before = sessions.length;
+                await expect(cache.prelicense({ ...drm, keySystem: 'com.apple.fps' }, 'cenc', pssh(0xc))).resolves.toBe(false);
+                await expect(cache.prelicense({ licenseUrl: 'https://other.example.invalid/' }, 'cenc', pssh(0xc))).resolves.toBe(false);
+                await expect(cache.prelicense(drm, 'cenc', Uint8Array.of(1, 2, 3))).resolves.toBe(false);
+                await expect(cache.prelicense(drm, 'sinf', pssh(0xc))).resolves.toBe(false);
+                expect(sessions).toHaveLength(before);
+                cache.close();
+                await expect(cache.prelicense(drm, 'cenc', pssh(0xc))).resolves.toBe(false);
+            });
+
+            it('a refused license rejects and closes the session', async () => {
+                const { cache, sessions, message, fetchLicense } = cached();
+                await settle();
+                fetchLicense.mockImplementationOnce(async () => ({ ok: false, status: 403, statusText: 'Forbidden', arrayBuffer: async () => new ArrayBuffer(0) }) as never);
+                const done = cache.prelicense(drm, 'cenc', pssh(0xd));
+                await settle();
+                const session = sessions.at(-1)!;
+                message(session);
+                await expect(done).rejects.toThrow('403');
+                expect(session.close).toHaveBeenCalled();
+                cache.close();
+            });
+        });
+
         it('returning to a licensed key ID reuses its session without a license request', async () => {
             const { adapter, cache, connect, license, encryptedKid, fetchLicense, sessions, message, requestAccess, video } = cached();
             const a = await license(0xa);

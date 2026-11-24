@@ -46,6 +46,7 @@ import { renderTrackMenus, playbackOwnerIsCurrent, selectionMenus, updateSelecti
     type PresentationChoice } from './selection-controls.js';
 import { TeardownBarrier, ViewRetuner, parseVideoAltGroup, waitForOutput } from './view-selection.js';
 import { readMsfLink, type PlayerMsfLink } from './msf-link.js';
+import { announcedKeys, prelicenseDelay } from './key-rotation.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -271,7 +272,9 @@ let player: MoqtPlayer | null = null;
 let mediaSourceRef: MseMediaSource | null = null;
 // One DRM session cache for the page, so a restart or switch to a broadcast
 // whose keys are already licensed reuses that license.
-const drmSessionCache = new DrmSessionCache();
+// Room for the sessions of a few key-rotation periods (video and audio each).
+const drmSessionCache = new DrmSessionCache({ maxSessions: 16 });
+const WIDEVINE_SYSTEM_ID = 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed';
 
 // ?msedebug=1 also shows the adapter's [DRM] and [STALL] console lines in the on-page log,
 // for a device without a console (an iPhone). They hold no key material.
@@ -1646,6 +1649,31 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
         buildTrackSelector(p);
         log('Catalog updated (delta).');
     });
+
+    // DRM key rotation: license the announced next key shortly before it takes
+    // effect (?prelicense=<minutes>, default 10; 0 turns it off), so the change
+    // needs no license request then, and a viewer who leaves earlier costs no
+    // license. Widevine only: FairPlay licenses at the change.
+    const prelicenseMinutes = Number(params.get('prelicense') ?? '10');
+    if (drmConfig && !drmConfig.keySystem?.startsWith('com.apple.fps') && prelicenseMinutes > 0) {
+        const scheduled = new Set<string>();
+        on('catalog_raw', (e) => {
+            if (!e.text) return;
+            for (const key of announcedKeys(e.text, WIDEVINE_SYSTEM_ID)) {
+                if (scheduled.has(key.kid)) continue;
+                scheduled.add(key.kid);
+                const delay = prelicenseDelay(key.validFrom, Date.now(), prelicenseMinutes * 60_000, 60_000, Math.random());
+                log(`[DRM] next key ${key.kid} from ${new Date(key.validFrom).toISOString()}: license in ${Math.round(delay / 1000)} s`);
+                setTimeout(() => {
+                    if (!playbackOwnerIsCurrent(p, epoch, player, playEpoch)) return;
+                    drmSessionCache.prelicense(drmConfig, 'cenc', key.pssh).then(
+                        (done) => log(`[DRM] next key ${key.kid} ${done ? 'licensed' : 'not prelicensed (no MediaKeys yet)'}`),
+                        (err) => log(`[DRM] next key ${key.kid} license failed: ${String(err)}`),
+                    );
+                }, delay);
+            }
+        });
+    }
 
     on('selection_changed', (e) => {
         if (e.catalog) catalogSelection = buildCatalogSelection(e.catalog, { catalogNamespace: namespaceArg });

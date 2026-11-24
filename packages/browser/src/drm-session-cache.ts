@@ -18,6 +18,13 @@ export interface DrmSessionCacheOptions {
   readonly maxSessions?: number;
 }
 
+/** Where {@link DrmSessionCache.prelicense} licenses: the adapters' DrmConfig fields that name a partition. */
+export interface PrelicenseConfig {
+  readonly keySystem?: string;
+  readonly licenseUrl: string;
+  readonly serverCertificate?: Uint8Array;
+}
+
 /** @internal One retained key session. */
 export interface DrmCachedSession {
   readonly session: MediaKeySession;
@@ -144,6 +151,79 @@ export class DrmSessionCache {
     void session.closed.then(() => this.drop(entry, false), () => this.drop(entry, false));
     this.evict();
     return entry;
+  }
+
+  /**
+   * License a key before any content needs it (key rotation: the next key a
+   * catalog announces), so the adapter that meets that key later reuses the
+   * session without a license request at that moment. Widevine-style `cenc`
+   * initialization only; FairPlay is not prelicensed. Needs this partition's
+   * MediaKeys, which an adapter using this cache creates.
+   *
+   * Resolves `true` once a usable session covers the initialization (also
+   * when one already did), `false` when skipped: FairPlay, no MediaKeys yet,
+   * closed cache, or initialization without key IDs. Rejects when the license
+   * request fails; the session is then closed. The session is idle once
+   * licensed and is evicted like any other idle session.
+   */
+  async prelicense(drm: PrelicenseConfig, initDataType: string, initData: Uint8Array,
+      options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<boolean> {
+    const keySystem = drm.keySystem ?? 'com.widevine.alpha';
+    if (this.isClosed || keySystem.startsWith('com.apple.fps') || initDataType !== 'cenc') return false;
+    const wanted = initDataKeyIds(initDataType, initData);
+    if (wanted.size === 0) return false;
+    const partition = drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate);
+    const keys = this.partitions.get(partition);
+    if (!keys) return false;
+    for (const entry of this.entries) {
+      if (entry.partition === partition && entry.usable && [...wanted].every((id) => entry.keyIds.has(id))) return true;
+    }
+    const data = initData.slice();
+    const session = keys.createSession('temporary');
+    const revoke = (): void => { /* Another adapter took it over: nothing held here to stop. */ };
+    const entry = this.track(partition, session, initDataType, data, revoke);
+    if (!entry) {
+      try { void session.close().catch(() => {}); } catch { /* not opened */ }
+      return false;
+    }
+    const abort = new AbortController();
+    const onAbort = (): void => abort.abort();
+    options.signal?.addEventListener('abort', onAbort);
+    const timer = setTimeout(() => abort.abort(), options.timeoutMs ?? 30_000);
+    try {
+      const licensed = new Promise<void>((resolve, reject) => {
+        const onMessage = (event: MediaKeyMessageEvent): void => {
+          session.removeEventListener('message', onMessage as EventListener);
+          void (async () => {
+            const response = await fetch(drm.licenseUrl, { method: 'POST', body: event.message, signal: abort.signal });
+            if (!response.ok) throw new Error(`License server returned ${response.status} ${response.statusText}`);
+            await session.update(new Uint8Array(await response.arrayBuffer()));
+          })().then(resolve, reject);
+        };
+        session.addEventListener('message', onMessage as EventListener);
+        abort.signal.addEventListener('abort', () => reject(new Error('prelicense aborted')));
+      });
+      licensed.catch(() => { /* awaited below; a failed generateRequest must not leave it unhandled */ });
+      await session.generateRequest(initDataType, data);
+      await licensed;
+      // keyStatuses may follow update(); wait for them before handing it back.
+      while (!entry.usable) {
+        if (abort.signal.aborted || !this.entries.has(entry)) throw new Error('prelicensed key not usable');
+        await new Promise<void>((resolve) => {
+          const done = (): void => { session.removeEventListener('keystatuseschange', done); resolve(); };
+          session.addEventListener('keystatuseschange', done);
+          abort.signal.addEventListener('abort', done);
+        });
+      }
+      return true;
+    } catch (err) {
+      this.drop(entry, true);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onAbort);
+      if (this.entries.has(entry)) this.release(entry, revoke);
+    }
   }
 
   /** @internal The holder is done. A session not yet usable is closed. */
