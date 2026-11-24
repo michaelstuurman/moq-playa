@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseMsfCatalog } from '@openmoq/msf';
 import { announcedKeys, prelicenseDelay } from './key-rotation.js';
 
 const WV = 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed';
@@ -41,5 +42,27 @@ describe('key rotation announcements', () => {
         expect(prelicenseDelay(change, change - 3_600_000, 600_000, 60_000, 0)).toBe(3_000_000);
         expect(prelicenseDelay(change, change - 3_600_000, 600_000, 60_000, 1)).toBe(2_940_000);
         expect(prelicenseDelay(change, change - 60_000, 600_000, 60_000, 0.5)).toBe(3_000);
+    });
+});
+
+describe('catalog parser and the announcement', () => {
+    it('accepts an announced key used by no track, and producer-defined track fields', () => {
+        const text = JSON.stringify({
+            version: '1',
+            contentProtections: [
+                { refID: '1', defaultKID: ['aaaaaaaa-0000-0000-0000-000000000000'], scheme: 'cbcs', drmSystem: { systemID: WV, pssh: 'AAECAw==' } },
+                { refID: 'next-2', defaultKID: ['bbbbbbbb-0000-0000-0000-000000000000'], scheme: 'cbcs', drmSystem: { systemID: WV, pssh: 'AAECAw==' } },
+            ],
+            tracks: [{
+                name: 'v', packaging: 'cmaf', isLive: true, role: 'video', codec: 'avc3.64001f', timescale: 90000,
+                bitrate: 4000000, framerate: 25, width: 1280, height: 720,
+                contentProtectionRefIDs: ['1'],
+                nextContentProtectionRefIDs: ['next-2'], nextKeyValidFrom: '2026-11-25T00:00:00Z',
+            }],
+        });
+        const catalog = parseMsfCatalog(text);
+        expect(catalog.contentProtections).toHaveLength(2);
+        expect(catalog.tracks[0]!.contentProtectionRefIDs).toEqual(['1']);
+        expect(announcedKeys(text, WV).map((k) => k.kid)).toEqual(['bbbbbbbb-0000-0000-0000-000000000000']);
     });
 });
