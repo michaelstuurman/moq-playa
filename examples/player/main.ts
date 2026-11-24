@@ -46,7 +46,7 @@ import { renderTrackMenus, playbackOwnerIsCurrent, selectionMenus, updateSelecti
     type PresentationChoice } from './selection-controls.js';
 import { TeardownBarrier, ViewRetuner, parseVideoAltGroup, waitForOutput } from './view-selection.js';
 import { readMsfLink, type PlayerMsfLink } from './msf-link.js';
-import { announcedKeys, prelicenseDelay } from './key-rotation.js';
+import { afterDelay, announcedKeys, prelicenseDelay } from './key-rotation.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -1664,13 +1664,13 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
                 scheduled.add(key.kid);
                 const delay = prelicenseDelay(key.validFrom, Date.now(), prelicenseMinutes * 60_000, 60_000, Math.random());
                 log(`[DRM] next key ${key.kid} from ${new Date(key.validFrom).toISOString()}: license in ${Math.round(delay / 1000)} s`);
-                setTimeout(() => {
+                afterDelay(delay, () => {
                     if (!playbackOwnerIsCurrent(p, epoch, player, playEpoch)) return;
                     drmSessionCache.prelicense(drmConfig, 'cenc', key.pssh).then(
                         (done) => log(`[DRM] next key ${key.kid} ${done ? 'licensed' : 'not prelicensed (no MediaKeys yet)'}`),
                         (err) => log(`[DRM] next key ${key.kid} license failed: ${String(err)}`),
                     );
-                }, delay);
+                }, () => !playbackOwnerIsCurrent(p, epoch, player, playEpoch));
             }
         });
     }

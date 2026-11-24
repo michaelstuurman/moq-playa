@@ -65,3 +65,22 @@ export function prelicenseDelay(validFrom: number, now: number, leadMs: number, 
     const at = validFrom - leadMs - random * spreadMs;
     return at > now ? at - now : random * (spreadMs / 10);
 }
+
+/** setTimeout's longest delay (2^31 - 1 ms, ~24.8 days); a longer one fires at once. */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Runs `run` after `delayMs`, also beyond setTimeout's limit (a key rotation
+ * period may be 30 days), by waiting in steps; `cancelled` is asked at every
+ * step and stops it. `timer` is for tests.
+ */
+export function afterDelay(delayMs: number, run: () => void, cancelled: () => boolean = () => false,
+    timer: (callback: () => void, ms: number) => unknown = setTimeout): void {
+    const step = Math.min(Math.max(delayMs, 0), MAX_TIMEOUT_MS);
+    timer(() => {
+        if (cancelled()) return;
+        const left = delayMs - step;
+        if (left > 0) afterDelay(left, run, cancelled, timer);
+        else run();
+    }, step);
+}

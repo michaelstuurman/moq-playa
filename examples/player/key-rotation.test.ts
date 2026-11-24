@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseMsfCatalog } from '@openmoq/msf';
-import { announcedKeys, prelicenseDelay } from './key-rotation.js';
+import { MAX_TIMEOUT_MS, afterDelay, announcedKeys, prelicenseDelay } from './key-rotation.js';
 
 const WV = 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed';
 const CK = '1077efec-c0b2-4d02-ace3-3c1e52e2fb4b';
@@ -64,5 +64,25 @@ describe('catalog parser and the announcement', () => {
         expect(catalog.contentProtections).toHaveLength(2);
         expect(catalog.tracks[0]!.contentProtectionRefIDs).toEqual(['1']);
         expect(announcedKeys(text, WV).map((k) => k.kid)).toEqual(['bbbbbbbb-0000-0000-0000-000000000000']);
+    });
+});
+
+describe('afterDelay', () => {
+    it('waits beyond the setTimeout limit in steps, and stops when cancelled', () => {
+        const waits: number[] = [];
+        const pending: Array<() => void> = [];
+        const timer = (callback: () => void, ms: number) => { waits.push(ms); pending.push(callback); };
+        let ran = 0;
+        const thirtyDays = 30 * 24 * 3_600_000;
+        afterDelay(thirtyDays, () => { ran++; }, () => false, timer);
+        while (pending.length) pending.shift()!();
+        expect(ran).toBe(1);
+        expect(waits.every((ms) => ms <= MAX_TIMEOUT_MS)).toBe(true);
+        expect(waits.reduce((a, b) => a + b, 0)).toBe(thirtyDays);
+        let stop = false;
+        afterDelay(thirtyDays, () => { ran++; }, () => stop, timer);
+        stop = true;
+        while (pending.length) pending.shift()!();
+        expect(ran).toBe(1);
     });
 });
