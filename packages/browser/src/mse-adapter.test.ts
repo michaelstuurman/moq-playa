@@ -4332,6 +4332,24 @@ describe('MseMediaSource DRM lifecycle', () => {
                 cache.close();
             });
 
+            it('answers every CDM message: a service certificate request, then the license request', async () => {
+                const { cache, sessions, message, fetchLicense } = cached();
+                await settle();
+                const done = cache.prelicense(drm, 'cenc', pssh(0xe));
+                await settle();
+                const session = sessions.at(-1)!;
+                message(session, 1); // service certificate request
+                await settle();
+                expect(session.update).toHaveBeenCalledTimes(1);
+                message(session, 2); // license request
+                await settle();
+                expect(fetchLicense).toHaveBeenCalledTimes(2);
+                expect(session.update).toHaveBeenCalledTimes(2);
+                session.setStatus(0xe, 'usable');
+                await expect(done).resolves.toBe(true);
+                cache.close();
+            });
+
             it('skips FairPlay, foreign partitions and initialization without key IDs', async () => {
                 const { cache, sessions } = cached();
                 await settle();

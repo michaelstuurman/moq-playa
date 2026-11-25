@@ -191,29 +191,39 @@ export class DrmSessionCache {
     options.signal?.addEventListener('abort', onAbort);
     const timer = setTimeout(() => abort.abort(), options.timeoutMs ?? 30_000);
     try {
-      const licensed = new Promise<void>((resolve, reject) => {
-        const onMessage = (event: MediaKeyMessageEvent): void => {
-          session.removeEventListener('message', onMessage as EventListener);
+      // Every CDM message goes to the license server and its answer back:
+      // Widevine first asks for the service certificate, then for the
+      // license, so this answers more than one message until the key is usable.
+      let onMessage: ((event: MediaKeyMessageEvent) => void) | null = null;
+      const failed = new Promise<never>((_, reject) => {
+        onMessage = (event: MediaKeyMessageEvent): void => {
           void (async () => {
             const response = await fetch(drm.licenseUrl, { method: 'POST', body: event.message, signal: abort.signal });
             if (!response.ok) throw new Error(`License server returned ${response.status} ${response.statusText}`);
             await session.update(new Uint8Array(await response.arrayBuffer()));
-          })().then(resolve, reject);
+          })().catch(reject);
         };
-        session.addEventListener('message', onMessage as EventListener);
         abort.signal.addEventListener('abort', () => reject(new Error('prelicense aborted')));
       });
-      licensed.catch(() => { /* awaited below; a failed generateRequest must not leave it unhandled */ });
-      await session.generateRequest(initDataType, data);
-      await licensed;
-      // keyStatuses may follow update(); wait for them before handing it back.
-      while (!entry.usable) {
-        if (abort.signal.aborted || !this.entries.has(entry)) throw new Error('prelicensed key not usable');
-        await new Promise<void>((resolve) => {
-          const done = (): void => { session.removeEventListener('keystatuseschange', done); resolve(); };
-          session.addEventListener('keystatuseschange', done);
-          abort.signal.addEventListener('abort', done);
-        });
+      failed.catch(() => { /* raced below; a failed generateRequest must not leave it unhandled */ });
+      session.addEventListener('message', onMessage as unknown as EventListener);
+      const usable = (async () => {
+        // keyStatuses follow the license's update().
+        while (!entry.usable) {
+          if (abort.signal.aborted || !this.entries.has(entry)) throw new Error('prelicensed key not usable');
+          await new Promise<void>((resolve) => {
+            const done = (): void => { session.removeEventListener('keystatuseschange', done); resolve(); };
+            session.addEventListener('keystatuseschange', done);
+            abort.signal.addEventListener('abort', done);
+          });
+        }
+      })();
+      usable.catch(() => { /* raced below */ });
+      try {
+        await session.generateRequest(initDataType, data);
+        await Promise.race([usable, failed]);
+      } finally {
+        session.removeEventListener('message', onMessage as unknown as EventListener);
       }
       return true;
     } catch (err) {
