@@ -1055,6 +1055,15 @@ export class MoqtPlayer {
   private cmafInitialized = false;
   /** Accepted source initialization, independent of later catalog declarations. */
   private readonly installedCmafInit = new Map<'video' | 'audio', { source: MediaSourceLike; bytes: Uint8Array }>();
+  /**
+   * A playing CMAF track whose catalog update changed only its initialization
+   * (MSF-02; a DRM key change): applied in place at the track's next group
+   * start by `changeType`, keeping subscriptions and the MediaSource. Objects
+   * arriving while it is applied are held in order.
+   */
+  private readonly pendingInitChange = new Map<'video' | 'audio', {
+    trackName: string; codec: string; init: Uint8Array; applying: boolean; held: Array<() => void>;
+  }>();
 
   /**
    * CMAF init-source state machine: one entry per selected CMAF track,
@@ -2553,6 +2562,7 @@ export class MoqtPlayer {
   /** MSF-02 §5.2.4 updates replace the playing declaration, not its old decoder. */
   private adoptUpdatedCatalog(state: CatalogState): void {
     const previous = this._catalogState;
+    const initChanges: Array<{ mediaType: 'video' | 'audio'; trackName: string; codec: string; init: Uint8Array }> = [];
     const changed = previous?.msfDraft === 'draft-02' && state.msfDraft === 'draft-02'
       && [...new Set([...this.configuredCatalogKeys, ...(['video', 'audio'] as const).flatMap(role => {
         const identity = this._selection[role];
@@ -2560,10 +2570,26 @@ export class MoqtPlayer {
       })])].some(key => {
         const before = previous.tracks.find(track => this.initKey(track) === key);
         const after = state.tracks.find(track => this.initKey(track) === key);
-        return before && after && (!this.catalogTrackAllowed(after, state) || (['codec', 'packaging', 'initData', 'initRef', 'role', 'altGroup', 'renderGroup', 'keyframeSpacing', 'samplerate', 'channelConfig'] as const)
-          .some(field => before[field] !== after[field]));
+        if (!before || !after) return false;
+        if (!this.catalogTrackAllowed(after, state)) return true;
+        const differs = (['codec', 'packaging', 'initData', 'initRef', 'role', 'altGroup', 'renderGroup', 'keyframeSpacing', 'samplerate', 'channelConfig'] as const)
+          .filter(field => before[field] !== after[field]);
+        if (differs.length === 0) return false;
+        // Only the initialization changed (a DRM key change keeps the track):
+        // apply it in place when the playing CMAF track can take it.
+        if (differs.every(field => field === 'initData' || field === 'initRef')) {
+          const change = this.inPlaceInitChange(after, state);
+          if (change) { initChanges.push(change); return false; }
+        }
+        return true;
       });
     this._catalogState = state;
+    if (!changed) {
+      for (const { mediaType, ...change } of initChanges) {
+        this.pendingInitChange.set(mediaType, { ...change, applying: false, held: [] });
+        this.log.info('[CMAF] %s "%s": new initialization from the next group', mediaType, change.trackName);
+      }
+    }
     // Retire excluded routes synchronously, before observers can deliver more media.
     if (state.msfDraft === 'draft-02' && this.connection) {
       const excluded = buildCatalogSelection(state, { catalogNamespace: this.config.namespace }).excluded;
@@ -2578,31 +2604,76 @@ export class MoqtPlayer {
         }
       }
     }
-    if (changed) {
-      this.catalogReselection?.cancel();
-      let cancel!: () => void;
-      const cancelled = new Promise<void>(resolve => { cancel = resolve; });
-      const owner = { cancel }; this.catalogReselection = owner;
-      const connection = this.connection, generation = this.bootstrapGeneration;
-      const current = () => this.catalogReselection === owner && this.connection === connection
-        && this.bootstrapGeneration === generation && !this._destroyed && !this.isTerminalState();
-      // Publish the complete catalog before callbacks can observe the new graph.
-      queueMicrotask(() => {
-        if (!current()) return;
-        void this.reselectUpdatedCatalog(current, cancelled).catch(error => {
-          if (!current()) return;
-          this.catalogPlaybackEpoch = {}; // Retire late authorization from the failed attempt.
-          this.log.warn('Catalog replacement needs delivery recovery: %s', String(error));
-          for (const mediaType of ['video', 'audio'] as const) {
-            const track = mediaType === 'video' ? this.qualityController?.currentVideoTrack : this.qualityController?.currentAudioTrack;
-            if (track && this.catalogTrackAllowed(track)) void this.handleTrackStarvation({
-              requestId: mediaType === 'video' ? -1n : -2n, trackAlias: mediaType === 'video' ? -1n : -2n, trackName: track.name, mediaType,
-            }, 0, 0, undefined, trackNamespaceFields(track, this.config.namespace));
-          }
-        }).finally(() => { if (this.catalogReselection === owner) this.catalogReselection = null; });
-      });
-    }
+    if (changed) this.startCatalogReselection();
     this.refreshMediaSelection();
+  }
+
+  /** Rebuild playback for a changed catalog on the same session (MSF-02). */
+  private startCatalogReselection(): void {
+    this.catalogReselection?.cancel();
+    let cancel!: () => void;
+    const cancelled = new Promise<void>(resolve => { cancel = resolve; });
+    const owner = { cancel }; this.catalogReselection = owner;
+    const connection = this.connection, generation = this.bootstrapGeneration;
+    const current = () => this.catalogReselection === owner && this.connection === connection
+      && this.bootstrapGeneration === generation && !this._destroyed && !this.isTerminalState();
+    // Publish the complete catalog before callbacks can observe the new graph.
+    queueMicrotask(() => {
+      if (!current()) return;
+      void this.reselectUpdatedCatalog(current, cancelled).catch(error => {
+        if (!current()) return;
+        this.catalogPlaybackEpoch = {}; // Retire late authorization from the failed attempt.
+        this.log.warn('Catalog replacement needs delivery recovery: %s', String(error));
+        for (const mediaType of ['video', 'audio'] as const) {
+          const track = mediaType === 'video' ? this.qualityController?.currentVideoTrack : this.qualityController?.currentAudioTrack;
+          if (track && this.catalogTrackAllowed(track)) void this.handleTrackStarvation({
+            requestId: mediaType === 'video' ? -1n : -2n, trackAlias: mediaType === 'video' ? -1n : -2n, trackName: track.name, mediaType,
+          }, 0, 0, undefined, trackNamespaceFields(track, this.config.namespace));
+        }
+      }).finally(() => { if (this.catalogReselection === owner) this.catalogReselection = null; });
+    });
+  }
+
+  /**
+   * The in-place initialization change of `after`, the playing CMAF track of
+   * its media type: same codec (checked by the caller), MSE with changeType,
+   * and decodable inline init. Null when it must be rebuilt instead.
+   */
+  private inPlaceInitChange(after: CatalogTrack, state: CatalogState):
+      { mediaType: 'video' | 'audio'; trackName: string; codec: string; init: Uint8Array } | null {
+    if (!this.cmafInitialized || !this.usesMse(after.packaging) || this.mediaSource?.changeType === undefined) return null;
+    const mediaType = (['video', 'audio'] as const).find(mt => {
+      const running = this.subscribedTrack(mt);
+      return running !== undefined && this.initKey(running) === this.initKey(after);
+    });
+    if (mediaType === undefined) return null;
+    let init: Uint8Array | undefined;
+    try { init = this.decodeResolvedInlineInitData(after, state); } catch { return null; }
+    if (init === undefined) return null;
+    return { mediaType, trackName: after.name, codec: after.codec ?? '', init };
+  }
+
+  /** Apply a pending initialization change, then release the objects held for it. */
+  private async applyInitChange(mediaType: 'video' | 'audio', change: {
+    trackName: string; codec: string; init: Uint8Array; applying: boolean; held: Array<() => void>;
+  }): Promise<void> {
+    const source = this.mediaSource;
+    try {
+      if (!source?.changeType) throw new Error('media source cannot reconfigure');
+      await source.changeType(mediaType, change.codec, change.init);
+    } catch (err) {
+      if (this.pendingInitChange.get(mediaType) === change) this.pendingInitChange.delete(mediaType);
+      change.held.length = 0;
+      if (this._destroyed || this.mediaSource !== source) return;
+      this.log.warn('[CMAF] %s initialization change in place failed (%s); rebuilding playback', mediaType, String(err));
+      this.startCatalogReselection();
+      return;
+    }
+    if (this.pendingInitChange.get(mediaType) === change) this.pendingInitChange.delete(mediaType);
+    if (this._destroyed || this.mediaSource !== source) return;
+    this.installedCmafInit.set(mediaType, { source, bytes: change.init.slice() });
+    this.log.info('[CMAF] %s "%s": initialization changed in place', mediaType, change.trackName);
+    for (const run of change.held.splice(0)) run();
   }
 
   /** Remove the old presentation before adding a new one, retaining the session and user intent. */
@@ -2650,6 +2721,7 @@ export class MoqtPlayer {
     this.syncController = null; this.recoveryController = null; this.locRateOutput = null;
     this.pipelinesCreated = false;
     this.cmafInitialized = false; this.cmafPendingInit = null; this.cmafVideoSynced = false;
+    this.pendingInitChange.clear();
     this.cmafHoldingForAttach = false; this.keyedCmafIdentity = false;
     this.installedCmafInit.clear(); this.cmafPreInitDropWarned.clear();
     this.locmafDecoders.clear(); this.locmafDecoderInit.clear(); this.locmafHealth.clear();
@@ -5089,23 +5161,39 @@ export class MoqtPlayer {
         return;
       }
 
-      // Early stale-group drop: skip objects from groups older than what
-      // MSE has already committed. Prevents late-arriving old groups from
-      // poisoning the assembler's patchEpoch (false backward-bmd detection).
-      const groupId = BigInt(obj.groupId);
-      if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
-        const floor = sourceKey === undefined ? this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName)
-          : this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName, sourceKey);
-        if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
-      }
+      const feed = (): void => {
+        // Early stale-group drop: skip objects from groups older than what
+        // MSE has already committed. Prevents late-arriving old groups from
+        // poisoning the assembler's patchEpoch (false backward-bmd detection).
+        const groupId = BigInt(obj.groupId);
+        if (this.mediaSource && 'getCommittedGroupFloor' in this.mediaSource) {
+          const floor = sourceKey === undefined ? this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName)
+            : this.mediaSource.getCommittedGroupFloor?.(mediaType, trackName, sourceKey);
+          if (floor !== undefined && groupId < floor) { this.discardMediaInput(input, 'stale group'); return; }
+        }
 
-      // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
-      if (this.cmafAssembler) this.recordDeliveredObject(obj);
-      const encode = mediaType === 'video' && !delivery?.backfill && !delivery?.fetched && delivery?.identity
-        ? this.encodeDeliveries.get(delivery.identity) : undefined;
-      const anchored = encode && encode.observation.location.groupId === String(obj.groupId)
-        && encode.observation.location.objectId === String(obj.objectId) ? encode : undefined;
-      this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId), lagOwner, anchored);
+        // Feed through assembler: pairs moof+mdat per group, patches tfdt, emits segments.
+        if (this.cmafAssembler) this.recordDeliveredObject(obj);
+        const encode = mediaType === 'video' && !delivery?.backfill && !delivery?.fetched && delivery?.identity
+          ? this.encodeDeliveries.get(delivery.identity) : undefined;
+        const anchored = encode && encode.observation.location.groupId === String(obj.groupId)
+          && encode.observation.location.objectId === String(obj.objectId) ? encode : undefined;
+        this.pushCmafInput(mediaType, trackName, groupId, obj.payload, input, sourceKey, BigInt(obj.objectId), lagOwner, anchored);
+      };
+
+      // An initialization changed in place (MSF-02 catalog update, a DRM key
+      // change): it applies from the track's next group start; objects that
+      // arrive while it is applied wait behind it in order.
+      const initChange = (mediaType === 'video' || mediaType === 'audio') ? this.pendingInitChange.get(mediaType) : undefined;
+      if (initChange && initChange.trackName === trackName && (initChange.applying || BigInt(obj.objectId) <= 1n)) {
+        initChange.held.push(feed);
+        if (!initChange.applying) {
+          initChange.applying = true;
+          void this.applyInitChange(mediaType as 'video' | 'audio', initChange);
+        }
+        return;
+      }
+      feed();
     };
 
     // §2.4.2: Malformed Track — MUST UNSUBSCRIBE, SHOULD deliver error
@@ -16944,7 +17032,7 @@ export class MoqtPlayer {
       const ownsOutput = this.ownedSeekOutput === output;
       const ownsAssembler = this.cmafAssembler === output.assembler;
       if (ownsOutput) { this.ownedSeekOutput = null; this.ownedSeekTransformAliases = null; }
-      if (ownsAssembler) { this.cmafAssembler = null; this.cmafInitialized = false; }
+      if (ownsAssembler) { this.cmafAssembler = null; this.cmafInitialized = false; this.pendingInitChange.clear(); }
       if (this.mseOutputEpoch === attempt.epoch) this.mseOutputEpoch = null;
       this.seekPosition?.retire(attempt.epoch);
       for (const [role, completion] of this.mseCompletions ?? []) {

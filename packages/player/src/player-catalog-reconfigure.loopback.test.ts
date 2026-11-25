@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { MoqtPlayerConfig } from './config.js';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
-import { videoInit } from '../../locmaf/test-support/cmaf.js';
+import { SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
 import type { CatalogState } from '@openmoq/msf';
 import { catToken } from '@openmoq/webtransport';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -71,6 +71,41 @@ it.each([{ codec: 'avc1.640032' }, { initData: 'BAUG' }])('reconfigures a playin
     const configuration = f.configurations.at(-1)!;
     expect(configuration[0]).toEqual(fields.initData ? Uint8Array.of(4, 5, 6) : Uint8Array.of(1, 2, 3));
     expect(configuration[1]).toBe(fields.codec ?? 'avc1.640028');
+    expect(f.errors).toEqual([]);
+  } finally { await f.close(); }
+});
+
+it('applies an initialization-only change of a playing CMAF track in place at its next group (DRM key change)', async () => {
+  const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
+  const changes: Array<[string, string, Uint8Array]> = [], appends: string[] = [], destroyedSources: number[] = [];
+  let release!: () => void;
+  const changed = new Promise<void>(resolve => { release = resolve; });
+  const source = () => ({
+    initialize() {}, appendChunk(mediaType: string) { appends.push(mediaType); },
+    changeType: async (mediaType: 'video' | 'audio', codec: string, init: Uint8Array) => { changes.push([mediaType, codec, init]); await changed; },
+    endOfStream() {}, reset() {}, destroy() { destroyedSources.push(1); }, currentTime: 0, duration: 0,
+    bufferedAhead: 0, playbackRate: 1, onError: null, onFirstFrame: null, onStall: null, onStallRecovered: null,
+  });
+  const f = await fixture('draft-02', { packaging: 'cmaf', initData: b64(videoInit()) },
+    { createMediaSource: source as unknown as MoqtPlayerConfig['createMediaSource'] });
+  try {
+    const chunk = (bmdt: number) => buildChunk({ bmdt, samples: [{ duration: 3000, size: 4, flags: SYNC_FLAGS }] });
+    const before = await f.server.openSubgroup(200n, 4n, 0n, { publisherPriority: 128 });
+    await f.server.sendObject(before, 0n, chunk(0)); await flush(256);
+    await f.update({ initData: b64(Uint8Array.of(9, 9, 9)) });
+    // The playing graph and subscriptions stay; nothing changes before the next group.
+    expect(f.requests.filter(r => r.name === 'v')).toHaveLength(1);
+    expect(destroyedSources).toEqual([]);
+    expect(changes).toEqual([]);
+    const next = await f.server.openSubgroup(200n, 5n, 0n, { publisherPriority: 128 });
+    await f.server.sendObject(next, 0n, chunk(3000));
+    await f.server.sendObject(next, 1n, chunk(6000)); await flush(256);
+    expect(changes).toEqual([['video', 'avc1.640028', Uint8Array.of(9, 9, 9)]]);
+    const held = appends.length;
+    release(); await flush(256);
+    expect(appends.length).toBeGreaterThanOrEqual(held); // Held objects follow the new initialization.
+    expect(f.requests.filter(r => r.name === 'v')).toHaveLength(1);
+    expect(destroyedSources).toEqual([]);
     expect(f.errors).toEqual([]);
   } finally { await f.close(); }
 });
