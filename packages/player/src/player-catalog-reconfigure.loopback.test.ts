@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MoqtPlayerConfig } from './config.js';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
-import { SYNC_FLAGS, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
+import { SYNC_FLAGS, audioInit, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
 import type { CatalogState } from '@openmoq/msf';
 import { catToken } from '@openmoq/webtransport';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -13,7 +13,8 @@ import { MoqtPlayer } from './player.js';
 beforeEach(() => vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] }));
 afterEach(() => vi.useRealTimers());
 const enc = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
-async function fixture(version = 'draft-02', initial: Record<string, unknown> = {}, config: Partial<MoqtPlayerConfig> = {}, alternate = false, timeline = false) {
+async function fixture(version = 'draft-02', initial: Record<string, unknown> = {}, config: Partial<MoqtPlayerConfig> = {}, alternate = false, timeline = false,
+  extra: Record<string, unknown>[] = []) {
   const { a, b } = createLoopback(), client = new MoqtConnection(23), server = new MoqtConnection(23, { role: 'server' });
   const requests: { id: bigint; name: string }[] = [], configurations: unknown[][] = [], destroyed: number[] = [], errors: string[] = [];
   const audioConfigurations: unknown[][] = [], mediaInitializations: unknown[] = [], mediaDestroyed: number[] = [];
@@ -46,7 +47,8 @@ async function fixture(version = 'draft-02', initial: Record<string, unknown> = 
     codec: 'avc1.640028', bitrate: 1000, framerate: 25, isLive: true, initData: 'AQID', altGroup: 1, ...initial },
     ...(alternate ? [{ name: 'low', role: 'video', packaging: 'loc', codec: 'avc1.640028',
       bitrate: 500, framerate: 25, isLive: false, initData: 'AQID', altGroup: 1 }] : []),
-    ...(timeline ? [{ name: 'timeline', packaging: 'mediatimeline', isLive: true, mimeType: 'application/json', depends: ['v'] }] : [])] }));
+    ...(timeline ? [{ name: 'timeline', packaging: 'mediatimeline', isLive: true, mimeType: 'application/json', depends: ['v'] }] : []),
+    ...extra] }));
   await flush(256);
   await server.acceptSubscribe(requests.find(r => r.name === 'v')!.id, 200n); await flush(256); player.play();
   let object = 0n;
@@ -113,19 +115,26 @@ it('applies an initialization-only change of a playing CMAF track in place at it
 describe('in-place initialization changes (DRM key rotation)', () => {
   const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
   const chunk = (bmdt: number) => buildChunk({ bmdt, samples: [{ duration: 3000, size: 4, flags: SYNC_FLAGS }] });
-  async function cmafFixture(alternate = false) {
+  async function cmafFixture(alternate = false, options: { audio?: boolean; videoGate?: Promise<void>; initial?: Record<string, unknown> } = {}) {
     const changes: Array<[string, string, Uint8Array, unknown]> = [], appends: bigint[] = [], destroyedSources: number[] = [];
     const source = () => ({
       initialize() {}, appendChunk(_mediaType: string, _segment: Uint8Array, _name: string, groupId: bigint) { appends.push(groupId); },
-      changeType: async (mediaType: 'video' | 'audio', codec: string, init: Uint8Array, options?: unknown) => {
-        changes.push([mediaType, codec, init, options]); },
+      changeType: async (mediaType: 'video' | 'audio', codec: string, init: Uint8Array, opts?: unknown) => {
+        changes.push([mediaType, codec, init, opts]);
+        if (mediaType === 'video' && options.videoGate) await options.videoGate; },
       endOfStream() {}, reset() {}, destroy() { destroyedSources.push(1); }, currentTime: 0, duration: 0,
       bufferedAhead: 0, playbackRate: 1, onError: null, onFirstFrame: null, onStall: null, onStallRecovered: null,
     });
-    const f = await fixture('draft-02', { packaging: 'cmaf', initData: b64(videoInit()) },
-      { createMediaSource: source as unknown as MoqtPlayerConfig['createMediaSource'] }, alternate);
-    const send = async (group: bigint, objects = 1) => {
-      const stream = await f.server.openSubgroup(200n, group, 0n, { publisherPriority: 128 });
+    const audio = options.audio ? [{ name: 'a', role: 'audio', packaging: 'cmaf', codec: 'mp4a.40.2', bitrate: 64000,
+      samplerate: 48000, channelConfig: '2', isLive: true, initData: b64(audioInit()), renderGroup: 1 }] : [];
+    const f = await fixture('draft-02', { packaging: 'cmaf', initData: b64(videoInit()), ...(options.audio ? { renderGroup: 1 } : {}), ...options.initial },
+      { createMediaSource: source as unknown as MoqtPlayerConfig['createMediaSource'] }, alternate, false, audio);
+    if (options.audio) {
+      const request = f.requests.find(r => r.name === 'a');
+      if (request) { await f.server.acceptSubscribe(request.id, 300n); await flush(256); }
+    }
+    const send = async (group: bigint, objects = 1, alias = 200n) => {
+      const stream = await f.server.openSubgroup(alias, group, 0n, { publisherPriority: 128 });
       for (let o = 0n; o < BigInt(objects); o++) await f.server.sendObject(stream, o, chunk(Number(group) * 3000 + Number(o)));
       await flush(256);
     };
@@ -157,6 +166,41 @@ describe('in-place initialization changes (DRM key rotation)', () => {
       await f.update({ initData: b64(Uint8Array.of(9, 9, 9)), initFromGroup: 6 });
       expect(changes).toEqual([]);
       expect(f.requests.filter(r => r.name === 'v')).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+
+  it('changes video and audio of one catalog update under one fence, without resubscribing', async () => {
+    let release!: () => void;
+    const videoGate = new Promise<void>(resolve => { release = resolve; });
+    const { f, changes, destroyedSources, send } = await cmafFixture(false, { audio: true, videoGate });
+    try {
+      expect(f.requests.some(r => r.name === 'a')).toBe(true);
+      const subscribes = f.requests.length;
+      await send(4n); await send(4n, 1, 300n);
+      await f.server.sendObject(await f.server.openSubgroup(100n, 2n, 0n, { publisherPriority: 128 }), 0n, enc({ version: 'draft-02', tracks: [
+        { name: 'v', role: 'video', packaging: 'cmaf', codec: 'avc1.640028', bitrate: 1000, framerate: 25, isLive: true, altGroup: 1, renderGroup: 1,
+          initData: b64(Uint8Array.of(9, 9, 9)), initFromGroup: 6 },
+        { name: 'a', role: 'audio', packaging: 'cmaf', codec: 'mp4a.40.2', bitrate: 64000, samplerate: 48000, channelConfig: '2', isLive: true,
+          renderGroup: 1, initData: b64(Uint8Array.of(8, 8, 8)), initFromGroup: 6 },
+      ] })); await flush(512);
+      await send(6n); // video retype starts and waits
+      await send(6n, 1, 300n); // audio arrives while video is retyping
+      release(); await flush(512);
+      expect(changes.map(c => c[0]).sort()).toEqual(['audio', 'video']);
+      expect(f.requests).toHaveLength(subscribes);
+      expect(destroyedSources).toEqual([]);
+      expect(f.errors).toEqual([]);
+    } finally { release(); await f.close(); }
+  });
+
+  it('drops a group before the current initialization for a viewer joining between catalog and initFromGroup', async () => {
+    const { f, appends, changes, send } = await cmafFixture(false, { initial: { initFromGroup: 6 } });
+    try {
+      await send(5n);
+      expect(appends).not.toContain(5n);
+      await send(6n);
+      expect(appends).toContain(6n);
+      expect(changes).toEqual([]);
     } finally { await f.close(); }
   });
 

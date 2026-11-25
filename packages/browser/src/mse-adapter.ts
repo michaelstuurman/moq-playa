@@ -1992,7 +1992,11 @@ export class MseMediaSource implements MediaSourceLike {
       const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
       while (queue.length > 0 || this.bufferBusy(mediaType, buffer)) {
         if (!this.bufferBusy(mediaType, buffer)) this.drainQueue(mediaType);
-        if (!this.bufferBusy(mediaType, buffer)) break; // Nothing appendable now (held or detached).
+        // Queued media that cannot be appended now (held or detached) would
+        // otherwise go in against the new initialization: refuse instead.
+        if (!this.bufferBusy(mediaType, buffer)) {
+          throw new Error(`MseMediaSource.changeType: ${mediaType} queued media cannot play out before the new initialization`);
+        }
         await this.waitForBufferEvent(buffer, this.inFlightOp[mediaType]);
         if (this.destroyed || generation !== this.bufferGen) return;
       }

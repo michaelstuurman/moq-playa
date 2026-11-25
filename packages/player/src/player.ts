@@ -869,6 +869,8 @@ function createLocSeekQuality(fromTrackName: string, toTrackName: string, reason
 /** An in-place initialization change pending for one media type (see MoqtPlayer.pendingInitChange). */
 interface PendingInitChange {
   trackName: string; codec: string; init: Uint8Array; fromGroup: bigint | null; applying: boolean; held: Array<() => void>;
+  /** Shared by the changes of one catalog update: video and audio retype under one fence owner. */
+  owner: object;
 }
 
 export class MoqtPlayer {
@@ -2594,6 +2596,7 @@ export class MoqtPlayer {
     this._catalogState = state;
     let rebuild = changed;
     if (!changed) {
+      const owner = {};
       for (const { mediaType, ...change } of initChanges) {
         const fed = this.lastFedGroup.get(mediaType);
         // Media of the new initialization already went in with the old one
@@ -2604,7 +2607,7 @@ export class MoqtPlayer {
           rebuild = true;
           break;
         }
-        this.pendingInitChange.set(mediaType, { ...change, applying: false, held: [] });
+        this.pendingInitChange.set(mediaType, { ...change, applying: false, held: [], owner });
         this.log.info('[CMAF] %s "%s": new initialization from group %s', mediaType, change.trackName,
           change.fromGroup === null ? 'next' : String(change.fromGroup));
       }
@@ -2691,16 +2694,22 @@ export class MoqtPlayer {
    * previous initialization's queued media play out first, then release the
    * objects held for it. A failure rebuilds playback.
    */
-  private async applyInitChange(mediaType: 'video' | 'audio', change: PendingInitChange): Promise<void> {
+  private async applyInitChange(mediaType: 'video' | 'audio', change: PendingInitChange, group: bigint): Promise<void> {
     const source = this.mediaSource;
     const previous = this.runningInitBytes(mediaType);
+    if (previous !== undefined && bytesEqual(previous, change.init)) {
+      // Already running this initialization (the track was left and rejoined).
+      if (this.pendingInitChange.get(mediaType) === change) this.pendingInitChange.delete(mediaType);
+      for (const run of change.held.splice(0)) run();
+      return;
+    }
     try {
       if (!source || previous === undefined) throw new Error('no running initialization');
       const offset = source.getTimestampOffset?.(mediaType);
-      await this.applyMediaRetype(change, { source, mediaType, codec: change.codec, next: change.init,
+      await this.applyMediaRetype(change.owner, { source, mediaType, codec: change.codec, next: change.init,
         previousCodec: change.codec, previous, offset, keepQueued: true });
     } catch (err) {
-      if (this.pendingRetypes.get(mediaType)?.owner === change) {
+      if (this.pendingRetypes.get(mediaType)?.owner === change.owner) {
         this.pendingRetypes.delete(mediaType);
         this.retypingMedia.delete(mediaType);
       }
@@ -2711,7 +2720,7 @@ export class MoqtPlayer {
       this.startCatalogReselection();
       return;
     }
-    if (this.pendingRetypes.get(mediaType)?.owner === change) {
+    if (this.pendingRetypes.get(mediaType)?.owner === change.owner) {
       this.pendingRetypes.delete(mediaType);
       this.retypingMedia.delete(mediaType);
     }
@@ -2719,7 +2728,7 @@ export class MoqtPlayer {
     if (this._destroyed || this.mediaSource !== source) return;
     this.cmafAssembler?.setInitSegment?.(mediaType, change.init);
     this.installedCmafInit.set(mediaType, { source, bytes: change.init.slice() });
-    this.log.info('[CMAF] %s "%s": initialization changed in place', mediaType, change.trackName);
+    this.log.info('[CMAF] %s "%s": initialization changed in place at group %s', mediaType, change.trackName, String(group));
     for (const run of change.held.splice(0)) run();
   }
 
@@ -5232,8 +5241,25 @@ export class MoqtPlayer {
       // change): it applies from the track's next group start; objects that
       // arrive while it is applied wait behind it in order.
       const media = mediaType === 'video' || mediaType === 'audio' ? mediaType : null;
-      const initChange = media ? this.pendingInitChange.get(media) : undefined;
+      let initChange = media ? this.pendingInitChange.get(media) : undefined;
       const group = BigInt(obj.groupId);
+      if (media && initChange && initChange.trackName !== trackName && !initChange.applying) {
+        // This media type now plays another track: the change was for the one it left.
+        this.pendingInitChange.delete(media);
+        initChange = undefined;
+      }
+      if (media && !initChange) {
+        // A group before the track's current initialization (a viewer joining
+        // between a key change's catalog and its first group, or a rebuild)
+        // would be decrypted with the wrong key.
+        const alias = BigInt(obj.trackAlias);
+        const sub = [...this.activeSubscriptions.values()].find(entry => entry.trackAlias === alias);
+        const declared = this.catalogTrackFor(trackName, sub?.namespace ?? namespaceFields(this.config.namespace), media);
+        if (declared?.initFromGroup !== undefined && group < BigInt(declared.initFromGroup)) {
+          this.discardMediaInput(input, 'stale group'); // before the current initialization
+          return;
+        }
+      }
       if (media && initChange && initChange.trackName === trackName) {
         const fed = this.lastFedGroup.get(media);
         // From initFromGroup on, else from the first group after those fed.
@@ -5243,7 +5269,7 @@ export class MoqtPlayer {
           initChange.held.push(feed);
           if (!initChange.applying) {
             initChange.applying = true;
-            void this.applyInitChange(media, initChange);
+            void this.applyInitChange(media, initChange, group);
           }
           return;
         }
