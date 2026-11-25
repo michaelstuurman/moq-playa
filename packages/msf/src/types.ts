@@ -239,6 +239,12 @@ export interface CatalogTrack {
     readonly template?: MsfMediaTemplate;
     /** @see draft-ietf-moq-cmsf-01 §4.1.2 — content-protection refIDs applying to this track */
     readonly contentProtectionRefIDs?: readonly string[];
+    /**
+     * Producer-defined (moqt-encoder DRM key rotation): the first group ID
+     * under this track's current initialization, after it changed within the
+     * track. Absent when the initialization never changed.
+     */
+    readonly initFromGroup?: number;
 }
 
 /**

@@ -498,6 +498,9 @@ export function extractRecognizedOptionalFields(
         ...(Array.isArray(obj['contentProtectionRefIDs'])                                          // CMSF §4.1.2
             ? { contentProtectionRefIDs: parseStringArray(trackName, 'contentProtectionRefIDs', obj['contentProtectionRefIDs']) }
             : {}),
+        // Producer-defined (moqt-encoder key rotation): first group of the current init.
+        ...(Number.isSafeInteger(obj['initFromGroup']) && (obj['initFromGroup'] as number) >= 0
+            ? { initFromGroup: obj['initFromGroup'] as number } : {}),
     };
 }
 

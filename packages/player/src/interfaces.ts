@@ -530,6 +530,8 @@ export interface MediaSourceLike {
     mediaType: 'video' | 'audio',
     codec: string,
     initData: Uint8Array,
+    /** keepQueued: queued media of the previous initialization plays out first (same media, e.g. a DRM key change). */
+    options?: { keepQueued?: boolean },
   ): Promise<void>;
 
   /**

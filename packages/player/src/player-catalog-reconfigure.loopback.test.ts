@@ -1,5 +1,5 @@
 /** Real SDK catalog deltas and adapter configuration; no native playback claim. */
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MoqtPlayerConfig } from './config.js';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
@@ -51,9 +51,9 @@ async function fixture(version = 'draft-02', initial: Record<string, unknown> = 
   await server.acceptSubscribe(requests.find(r => r.name === 'v')!.id, 200n); await flush(256); player.play();
   let object = 0n;
   return { player, server, requests, configurations, destroyed, errors, audioConfigurations, mediaInitializations, mediaDestroyed, get catalog() { return catalog; },
-    async update(fields: Record<string, unknown>) {
+    async update(fields: Record<string, unknown>, parentName = 'v') {
       await server.sendObject(stream, ++object, enc({ generatedAt: Number(object), deltaUpdate: [
-        { op: 'update', tracks: [{ parentName: 'v', ...fields }] },
+        { op: 'update', tracks: [{ parentName, ...fields }] },
       ] })); await flush(512);
     },
     async close() { await player.destroy(); await server.close(); await serving; },
@@ -108,6 +108,67 @@ it('applies an initialization-only change of a playing CMAF track in place at it
     expect(destroyedSources).toEqual([]);
     expect(f.errors).toEqual([]);
   } finally { await f.close(); }
+});
+
+describe('in-place initialization changes (DRM key rotation)', () => {
+  const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64');
+  const chunk = (bmdt: number) => buildChunk({ bmdt, samples: [{ duration: 3000, size: 4, flags: SYNC_FLAGS }] });
+  async function cmafFixture(alternate = false) {
+    const changes: Array<[string, string, Uint8Array, unknown]> = [], appends: bigint[] = [], destroyedSources: number[] = [];
+    const source = () => ({
+      initialize() {}, appendChunk(_mediaType: string, _segment: Uint8Array, _name: string, groupId: bigint) { appends.push(groupId); },
+      changeType: async (mediaType: 'video' | 'audio', codec: string, init: Uint8Array, options?: unknown) => {
+        changes.push([mediaType, codec, init, options]); },
+      endOfStream() {}, reset() {}, destroy() { destroyedSources.push(1); }, currentTime: 0, duration: 0,
+      bufferedAhead: 0, playbackRate: 1, onError: null, onFirstFrame: null, onStall: null, onStallRecovered: null,
+    });
+    const f = await fixture('draft-02', { packaging: 'cmaf', initData: b64(videoInit()) },
+      { createMediaSource: source as unknown as MoqtPlayerConfig['createMediaSource'] }, alternate);
+    const send = async (group: bigint, objects = 1) => {
+      const stream = await f.server.openSubgroup(200n, group, 0n, { publisherPriority: 128 });
+      for (let o = 0n; o < BigInt(objects); o++) await f.server.sendObject(stream, o, chunk(Number(group) * 3000 + Number(o)));
+      await flush(256);
+    };
+    return { f, changes, appends, destroyedSources, send };
+  }
+
+  it('applies at initFromGroup, keeps a late earlier group on the old init, and never resubscribes', async () => {
+    const { f, changes, appends, destroyedSources, send } = await cmafFixture();
+    try {
+      await send(4n);
+      await f.update({ initData: b64(Uint8Array.of(9, 9, 9)), initFromGroup: 6 });
+      await send(5n); // late group under the old key
+      expect(changes).toEqual([]);
+      expect(appends).toContain(5n);
+      await send(6n, 2);
+      expect(changes).toEqual([['video', 'avc1.640028', Uint8Array.of(9, 9, 9), { keepQueued: true }]]);
+      expect(appends).toContain(6n);
+      expect(f.requests.filter(r => r.name === 'v')).toHaveLength(1);
+      expect(destroyedSources).toEqual([]);
+      expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('rebuilds when a group under the new initialization arrived before its catalog', async () => {
+    const { f, changes, send } = await cmafFixture();
+    try {
+      await send(4n);
+      await send(6n);
+      await f.update({ initData: b64(Uint8Array.of(9, 9, 9)), initFromGroup: 6 });
+      expect(changes).toEqual([]);
+      expect(f.requests.filter(r => r.name === 'v')).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+
+  it('needs nothing for a track that is not playing', async () => {
+    const { f, changes } = await cmafFixture(true);
+    try {
+      await f.update({ initData: b64(Uint8Array.of(7, 7, 7)) }, 'low');
+      expect(changes).toEqual([]);
+      expect(f.requests.filter(r => r.name === 'v')).toHaveLength(1);
+      expect(f.errors).toEqual([]);
+    } finally { await f.close(); }
+  });
 });
 
 it('adopts bitrate-only changes without restarting the playing graph', async () => {

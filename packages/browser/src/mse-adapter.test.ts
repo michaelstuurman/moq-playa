@@ -1000,6 +1000,20 @@ describe('MseMediaSource — changeType', () => {
         expect(vsb.appendedPayloads.length).toBe(initCountBefore + 1);
     });
 
+    it('keepQueued: queued media of the previous initialization plays out before the new init (key change)', async () => {
+        const { adapter, vsb } = await makeReadyAdapter();
+        vsb.updating = true;
+        const seg = makeSegment({ bmd: 0, defaultDur: 100, sampleCount: 5 });
+        adapter.appendChunk('video', seg, 'video_avc'); // queued under the old key
+        vsb.updating = false;
+        const initCountBefore = vsb.appendedPayloads.length;
+        await adapter.changeType('video', 'avc1.42c01e', makeInit(1, 100), { keepQueued: true });
+        await flush();
+        // The queued segment, then the new init; same MIME, so no native retype.
+        expect(vsb.appendedPayloads.length).toBe(initCountBefore + 2);
+        expect(vsb.changeTypeCalls).toEqual([]);
+    });
+
     it('keeps timestampOffset: switching-set tracks share one media timeline', async () => {
         const { adapter, video, vsb } = await makeReadyAdapter();
         // Playback is well under way when the switch happens.

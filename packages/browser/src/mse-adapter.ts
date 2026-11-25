@@ -1977,12 +1977,25 @@ export class MseMediaSource implements MediaSourceLike {
     mediaType: 'video' | 'audio',
     codec: string,
     initData: Uint8Array,
+    options: { keepQueued?: boolean } = {},
   ): Promise<void> {
     if (this.destroyed) return;
     const generation = this.bufferGen;
     const buffer = mediaType === 'video' ? this.videoBuffer : this.audioBuffer;
     if (!buffer) {
       throw new Error(`MseMediaSource.changeType: ${mediaType} SourceBuffer not initialized`);
+    }
+    if (options.keepQueued) {
+      // A new initialization for the SAME media (a DRM key change): the
+      // queued media belongs to the previous initialization and plays out
+      // first; the caller holds the target media until this resolves.
+      const queue = mediaType === 'video' ? this.videoQueue : this.audioQueue;
+      while (queue.length > 0 || this.bufferBusy(mediaType, buffer)) {
+        if (!this.bufferBusy(mediaType, buffer)) this.drainQueue(mediaType);
+        if (!this.bufferBusy(mediaType, buffer)) break; // Nothing appendable now (held or detached).
+        await this.waitForBufferEvent(buffer, this.inFlightOp[mediaType]);
+        if (this.destroyed || generation !== this.bufferGen) return;
+      }
     }
     // The adoption prepares its target before activating; any later video reconfiguration is not its own.
     if (mediaType === 'video' && this.switchRecovery && this.switchRecovery.state !== 'reserved') this.revokeSwitchRecovery();

@@ -866,6 +866,11 @@ function createLocSeekQuality(fromTrackName: string, toTrackName: string, reason
     } };
   return { quality, done };
 }
+/** An in-place initialization change pending for one media type (see MoqtPlayer.pendingInitChange). */
+interface PendingInitChange {
+  trackName: string; codec: string; init: Uint8Array; fromGroup: bigint | null; applying: boolean; held: Array<() => void>;
+}
+
 export class MoqtPlayer {
   /** Player version (set at build time). */
   static readonly version = '0.7.0';
@@ -1061,9 +1066,9 @@ export class MoqtPlayer {
    * start by `changeType`, keeping subscriptions and the MediaSource. Objects
    * arriving while it is applied are held in order.
    */
-  private readonly pendingInitChange = new Map<'video' | 'audio', {
-    trackName: string; codec: string; init: Uint8Array; applying: boolean; held: Array<() => void>;
-  }>();
+  private readonly pendingInitChange = new Map<'video' | 'audio', PendingInitChange>();
+  /** Per media type: the newest group ID fed toward MSE, for in-place initialization changes. */
+  private readonly lastFedGroup = new Map<'video' | 'audio', { trackName: string; groupId: bigint }>();
 
   /**
    * CMAF init-source state machine: one entry per selected CMAF track,
@@ -2562,7 +2567,7 @@ export class MoqtPlayer {
   /** MSF-02 §5.2.4 updates replace the playing declaration, not its old decoder. */
   private adoptUpdatedCatalog(state: CatalogState): void {
     const previous = this._catalogState;
-    const initChanges: Array<{ mediaType: 'video' | 'audio'; trackName: string; codec: string; init: Uint8Array }> = [];
+    const initChanges: Array<{ mediaType: 'video' | 'audio'; trackName: string; codec: string; init: Uint8Array; fromGroup: bigint | null }> = [];
     const changed = previous?.msfDraft === 'draft-02' && state.msfDraft === 'draft-02'
       && [...new Set([...this.configuredCatalogKeys, ...(['video', 'audio'] as const).flatMap(role => {
         const identity = this._selection[role];
@@ -2576,19 +2581,34 @@ export class MoqtPlayer {
           .filter(field => before[field] !== after[field]);
         if (differs.length === 0) return false;
         // Only the initialization changed (a DRM key change keeps the track):
-        // apply it in place when the playing CMAF track can take it.
-        if (differs.every(field => field === 'initData' || field === 'initRef')) {
+        // apply it in place when the playing CMAF track can take it. A track
+        // that is not playing needs nothing: it starts from the catalog's init.
+        // While a rebuild is under way it decides, as before.
+        if (differs.every(field => field === 'initData' || field === 'initRef') && this.catalogReselection === null) {
+          if (!this.isPlayingTrack(after)) return false;
           const change = this.inPlaceInitChange(after, state);
           if (change) { initChanges.push(change); return false; }
         }
         return true;
       });
     this._catalogState = state;
+    let rebuild = changed;
     if (!changed) {
       for (const { mediaType, ...change } of initChanges) {
+        const fed = this.lastFedGroup.get(mediaType);
+        // Media of the new initialization already went in with the old one
+        // (the catalog arrived after it): rebuild playback instead.
+        if (change.fromGroup !== null && fed?.trackName === change.trackName && fed.groupId >= change.fromGroup) {
+          this.log.warn('[CMAF] %s "%s": group %s under the new initialization arrived before its catalog; rebuilding',
+            mediaType, change.trackName, String(change.fromGroup));
+          rebuild = true;
+          break;
+        }
         this.pendingInitChange.set(mediaType, { ...change, applying: false, held: [] });
-        this.log.info('[CMAF] %s "%s": new initialization from the next group', mediaType, change.trackName);
+        this.log.info('[CMAF] %s "%s": new initialization from group %s', mediaType, change.trackName,
+          change.fromGroup === null ? 'next' : String(change.fromGroup));
       }
+      if (rebuild) for (const { mediaType } of initChanges) this.pendingInitChange.delete(mediaType);
     }
     // Retire excluded routes synchronously, before observers can deliver more media.
     if (state.msfDraft === 'draft-02' && this.connection) {
@@ -2604,7 +2624,7 @@ export class MoqtPlayer {
         }
       }
     }
-    if (changed) this.startCatalogReselection();
+    if (rebuild) this.startCatalogReselection();
     this.refreshMediaSelection();
   }
 
@@ -2639,8 +2659,19 @@ export class MoqtPlayer {
    * its media type: same codec (checked by the caller), MSE with changeType,
    * and decodable inline init. Null when it must be rebuilt instead.
    */
+  /** Subscribed now, or the selection a pending reselection is rebuilding. */
+  private isPlayingTrack(track: CatalogTrack): boolean {
+    const key = this.initKey(track);
+    return (['video', 'audio'] as const).some(mt => {
+      const running = this.subscribedTrack(mt);
+      const selected = this._selection[mt];
+      return (running !== undefined && this.initKey(running) === key)
+        || (selected !== null && selected !== undefined && identityKey(selected.namespaceFields, selected.name) === key);
+    });
+  }
+
   private inPlaceInitChange(after: CatalogTrack, state: CatalogState):
-      { mediaType: 'video' | 'audio'; trackName: string; codec: string; init: Uint8Array } | null {
+      { mediaType: 'video' | 'audio'; trackName: string; codec: string; init: Uint8Array; fromGroup: bigint | null } | null {
     if (!this.cmafInitialized || !this.usesMse(after.packaging) || this.mediaSource?.changeType === undefined) return null;
     const mediaType = (['video', 'audio'] as const).find(mt => {
       const running = this.subscribedTrack(mt);
@@ -2650,18 +2681,29 @@ export class MoqtPlayer {
     let init: Uint8Array | undefined;
     try { init = this.decodeResolvedInlineInitData(after, state); } catch { return null; }
     if (init === undefined) return null;
-    return { mediaType, trackName: after.name, codec: after.codec ?? '', init };
+    return { mediaType, trackName: after.name, codec: after.codec ?? '', init,
+      fromGroup: after.initFromGroup === undefined ? null : BigInt(after.initFromGroup) };
   }
 
-  /** Apply a pending initialization change, then release the objects held for it. */
-  private async applyInitChange(mediaType: 'video' | 'audio', change: {
-    trackName: string; codec: string; init: Uint8Array; applying: boolean; held: Array<() => void>;
-  }): Promise<void> {
+  /**
+   * Apply a pending initialization change through the retype fence (no
+   * concurrent video switch, audio choice or handover retype), letting the
+   * previous initialization's queued media play out first, then release the
+   * objects held for it. A failure rebuilds playback.
+   */
+  private async applyInitChange(mediaType: 'video' | 'audio', change: PendingInitChange): Promise<void> {
     const source = this.mediaSource;
+    const previous = this.runningInitBytes(mediaType);
     try {
-      if (!source?.changeType) throw new Error('media source cannot reconfigure');
-      await source.changeType(mediaType, change.codec, change.init);
+      if (!source || previous === undefined) throw new Error('no running initialization');
+      const offset = source.getTimestampOffset?.(mediaType);
+      await this.applyMediaRetype(change, { source, mediaType, codec: change.codec, next: change.init,
+        previousCodec: change.codec, previous, offset, keepQueued: true });
     } catch (err) {
+      if (this.pendingRetypes.get(mediaType)?.owner === change) {
+        this.pendingRetypes.delete(mediaType);
+        this.retypingMedia.delete(mediaType);
+      }
       if (this.pendingInitChange.get(mediaType) === change) this.pendingInitChange.delete(mediaType);
       change.held.length = 0;
       if (this._destroyed || this.mediaSource !== source) return;
@@ -2669,8 +2711,13 @@ export class MoqtPlayer {
       this.startCatalogReselection();
       return;
     }
+    if (this.pendingRetypes.get(mediaType)?.owner === change) {
+      this.pendingRetypes.delete(mediaType);
+      this.retypingMedia.delete(mediaType);
+    }
     if (this.pendingInitChange.get(mediaType) === change) this.pendingInitChange.delete(mediaType);
     if (this._destroyed || this.mediaSource !== source) return;
+    this.cmafAssembler?.setInitSegment?.(mediaType, change.init);
     this.installedCmafInit.set(mediaType, { source, bytes: change.init.slice() });
     this.log.info('[CMAF] %s "%s": initialization changed in place', mediaType, change.trackName);
     for (const run of change.held.splice(0)) run();
@@ -2721,7 +2768,7 @@ export class MoqtPlayer {
     this.syncController = null; this.recoveryController = null; this.locRateOutput = null;
     this.pipelinesCreated = false;
     this.cmafInitialized = false; this.cmafPendingInit = null; this.cmafVideoSynced = false;
-    this.pendingInitChange.clear();
+    this.pendingInitChange.clear(); this.lastFedGroup.clear();
     this.cmafHoldingForAttach = false; this.keyedCmafIdentity = false;
     this.installedCmafInit.clear(); this.cmafPreInitDropWarned.clear();
     this.locmafDecoders.clear(); this.locmafDecoderInit.clear(); this.locmafHealth.clear();
@@ -5184,14 +5231,27 @@ export class MoqtPlayer {
       // An initialization changed in place (MSF-02 catalog update, a DRM key
       // change): it applies from the track's next group start; objects that
       // arrive while it is applied wait behind it in order.
-      const initChange = (mediaType === 'video' || mediaType === 'audio') ? this.pendingInitChange.get(mediaType) : undefined;
-      if (initChange && initChange.trackName === trackName && (initChange.applying || BigInt(obj.objectId) <= 1n)) {
-        initChange.held.push(feed);
-        if (!initChange.applying) {
-          initChange.applying = true;
-          void this.applyInitChange(mediaType as 'video' | 'audio', initChange);
+      const media = mediaType === 'video' || mediaType === 'audio' ? mediaType : null;
+      const initChange = media ? this.pendingInitChange.get(media) : undefined;
+      const group = BigInt(obj.groupId);
+      if (media && initChange && initChange.trackName === trackName) {
+        const fed = this.lastFedGroup.get(media);
+        // From initFromGroup on, else from the first group after those fed.
+        const starts = initChange.fromGroup !== null ? group >= initChange.fromGroup
+          : fed === undefined || fed.trackName !== trackName || group > fed.groupId;
+        if (starts) {
+          initChange.held.push(feed);
+          if (!initChange.applying) {
+            initChange.applying = true;
+            void this.applyInitChange(media, initChange);
+          }
+          return;
         }
-        return;
+        // A late object of an earlier group keeps the old initialization.
+      }
+      if (media) {
+        const fed = this.lastFedGroup.get(media);
+        if (fed === undefined || fed.trackName !== trackName || group > fed.groupId) this.lastFedGroup.set(media, { trackName, groupId: group });
       }
       feed();
     };
@@ -7815,6 +7875,7 @@ export class MoqtPlayer {
     previousCodec: string;
     previous: Uint8Array;
     offset: number | undefined;
+    keepQueued?: boolean;
   }): Promise<void> {
     const { source, mediaType, codec, next, previousCodec, previous, offset } = change;
     if (this._destroyed || this.isTerminalState() || source !== this.mediaSource) {
@@ -7827,7 +7888,8 @@ export class MoqtPlayer {
     if (!source.changeType) throw new Error('Media source cannot reconfigure');
     this.retypingMedia.add(mediaType);
     this.pendingRetypes.set(mediaType, { owner, source, codec: previousCodec, previous, offset });
-    await source.changeType(mediaType, codec, next);
+    await (change.keepQueued ? source.changeType(mediaType, codec, next, { keepQueued: true })
+      : source.changeType(mediaType, codec, next));
     if (!this._destroyed && source === this.mediaSource) this.restoreTimestampOffset(mediaType, offset, source);
   }
 
@@ -17032,7 +17094,7 @@ export class MoqtPlayer {
       const ownsOutput = this.ownedSeekOutput === output;
       const ownsAssembler = this.cmafAssembler === output.assembler;
       if (ownsOutput) { this.ownedSeekOutput = null; this.ownedSeekTransformAliases = null; }
-      if (ownsAssembler) { this.cmafAssembler = null; this.cmafInitialized = false; this.pendingInitChange.clear(); }
+      if (ownsAssembler) { this.cmafAssembler = null; this.cmafInitialized = false; this.pendingInitChange.clear(); this.lastFedGroup.clear(); }
       if (this.mseOutputEpoch === attempt.epoch) this.mseOutputEpoch = null;
       this.seekPosition?.retire(attempt.epoch);
       for (const [role, completion] of this.mseCompletions ?? []) {
