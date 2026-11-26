@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MoqtPlayerConfig } from './config.js';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
-import { SYNC_FLAGS, audioInit, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
+import { SYNC_FLAGS, audioInit, buildChunk, buildInit, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
 import type { CatalogState } from '@openmoq/msf';
 import { catToken } from '@openmoq/webtransport';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -219,6 +219,37 @@ describe('in-place initialization changes (DRM key rotation)', () => {
       expect(destroyedSources).toEqual([]);
       expect(f.errors).toEqual([]);
     } finally { await f.close(); }
+  });
+
+  it('in-band video, then the catalog, then in-band audio while video still retypes: no rebuild', async () => {
+    let release!: () => void;
+    const videoGate = new Promise<void>(resolve => { release = resolve; });
+    const { f, changes, appends, destroyedSources, send } = await cmafFixture(false, { audio: true, videoGate });
+    try {
+      const subscribes = f.requests.length;
+      await send(4n); await send(4n, 1, 300n);
+      const nextVideo = cencVideoInit(8);
+      const nextAudio = buildInit({ trackId: 2, timescale: 48000, handler: 'soun', encryption: { scheme: 'cenc', perSampleIvSize: 8 } });
+      const video = await f.server.openSubgroup(200n, 6n, 0n, { publisherPriority: 128 });
+      await f.server.sendObject(video, 0n, nextVideo);
+      await f.server.sendObject(video, 1n, chunk(18000)); await flush(256); // video retype waits on the gate
+      await f.server.sendObject(await f.server.openSubgroup(100n, 2n, 0n, { publisherPriority: 128 }), 0n, enc({ version: 'draft-02', tracks: [
+        { name: 'v', role: 'video', packaging: 'cmaf', codec: 'avc1.640028', bitrate: 1000, framerate: 25, isLive: true, altGroup: 1, renderGroup: 1,
+          initData: b64(nextVideo), initFromGroup: 6 },
+        { name: 'a', role: 'audio', packaging: 'cmaf', codec: 'mp4a.40.2', bitrate: 64000, samplerate: 48000, channelConfig: '2', isLive: true,
+          renderGroup: 1, initData: b64(nextAudio), initFromGroup: 6 },
+      ] })); await flush(512);
+      const audio = await f.server.openSubgroup(300n, 6n, 0n, { publisherPriority: 128 });
+      await f.server.sendObject(audio, 0n, nextAudio);
+      await f.server.sendObject(audio, 1n, chunk(18000)); await flush(256);
+      release(); await flush(512);
+      expect(changes.map(c => c[0]).sort()).toEqual(['audio', 'video']);
+      expect(f.requests).toHaveLength(subscribes);
+      expect(destroyedSources).toEqual([]);
+      await send(5n); // a late object of the group before the change is dropped
+      expect(appends.filter(g => g === 5n)).toEqual([]);
+      expect(f.errors).toEqual([]);
+    } finally { release(); await f.close(); }
   });
 
   it('needs nothing for a track that is not playing', async () => {

@@ -869,8 +869,8 @@ function createLocSeekQuality(fromTrackName: string, toTrackName: string, reason
 /** An in-place initialization change pending for one media type (see MoqtPlayer.pendingInitChange). */
 interface PendingInitChange {
   trackName: string; codec: string; init: Uint8Array; fromGroup: bigint | null; applying: boolean; held: Array<() => void>;
-  /** Shared by the changes of one catalog update: video and audio retype under one fence owner. */
-  owner: object;
+  /** Where the initialization came from, for the log. */
+  via: 'catalog' | 'in band';
 }
 
 export class MoqtPlayer {
@@ -1069,8 +1069,10 @@ export class MoqtPlayer {
    * arriving while it is applied are held in order.
    */
   private readonly pendingInitChange = new Map<'video' | 'audio', PendingInitChange>();
-  /** One retype-fence owner for in-band initialization changes: video and audio change together. */
-  private readonly inBandInitOwner = {};
+  /** The one retype-fence owner of every in-place initialization change: video and audio change together. */
+  private readonly initChangeOwner = {};
+  /** Per media type: the group at which an initialization was last applied in place; earlier groups are dropped. */
+  private readonly initAppliedGroup = new Map<'video' | 'audio', { trackName: string; groupId: bigint }>();
   /** Per media type: the newest group ID fed toward MSE, for in-place initialization changes. */
   private readonly lastFedGroup = new Map<'video' | 'audio', { trackName: string; groupId: bigint }>();
 
@@ -2598,7 +2600,6 @@ export class MoqtPlayer {
     this._catalogState = state;
     let rebuild = changed;
     if (!changed) {
-      const owner = {};
       for (const { mediaType, ...change } of initChanges) {
         // Already running or being applied (it came in band, ahead of this catalog).
         const running = this.runningInitBytes(mediaType), inflight = this.pendingInitChange.get(mediaType);
@@ -2613,7 +2614,7 @@ export class MoqtPlayer {
           rebuild = true;
           break;
         }
-        this.pendingInitChange.set(mediaType, { ...change, applying: false, held: [], owner });
+        this.pendingInitChange.set(mediaType, { ...change, applying: false, held: [], via: 'catalog' });
         this.log.info('[CMAF] %s "%s": new initialization from group %s', mediaType, change.trackName,
           change.fromGroup === null ? 'next' : String(change.fromGroup));
       }
@@ -2711,11 +2712,12 @@ export class MoqtPlayer {
     }
     try {
       if (!source || previous === undefined) throw new Error('no running initialization');
+      if (change.codec === '') throw new Error('the playing track declares no codec');
       const offset = source.getTimestampOffset?.(mediaType);
-      await this.applyMediaRetype(change.owner, { source, mediaType, codec: change.codec, next: change.init,
+      await this.applyMediaRetype(this.initChangeOwner, { source, mediaType, codec: change.codec, next: change.init,
         previousCodec: change.codec, previous, offset, keepQueued: true });
     } catch (err) {
-      if (this.pendingRetypes.get(mediaType)?.owner === change.owner) {
+      if (this.pendingRetypes.get(mediaType)?.owner === this.initChangeOwner) {
         this.pendingRetypes.delete(mediaType);
         this.retypingMedia.delete(mediaType);
       }
@@ -2726,7 +2728,7 @@ export class MoqtPlayer {
       this.startCatalogReselection();
       return;
     }
-    if (this.pendingRetypes.get(mediaType)?.owner === change.owner) {
+    if (this.pendingRetypes.get(mediaType)?.owner === this.initChangeOwner) {
       this.pendingRetypes.delete(mediaType);
       this.retypingMedia.delete(mediaType);
     }
@@ -2734,7 +2736,8 @@ export class MoqtPlayer {
     if (this._destroyed || this.mediaSource !== source) return;
     this.cmafAssembler?.setInitSegment?.(mediaType, change.init);
     this.installedCmafInit.set(mediaType, { source, bytes: change.init.slice() });
-    this.log.info('[CMAF] %s "%s": initialization changed in place at group %s', mediaType, change.trackName, String(group));
+    this.initAppliedGroup.set(mediaType, { trackName: change.trackName, groupId: group });
+    this.log.info('[CMAF] %s "%s": initialization (%s) changed in place at group %s', mediaType, change.trackName, change.via, String(group));
     for (const run of change.held.splice(0)) run();
   }
 
@@ -2783,7 +2786,7 @@ export class MoqtPlayer {
     this.syncController = null; this.recoveryController = null; this.locRateOutput = null;
     this.pipelinesCreated = false;
     this.cmafInitialized = false; this.cmafPendingInit = null; this.cmafVideoSynced = false;
-    this.pendingInitChange.clear(); this.lastFedGroup.clear();
+    this.pendingInitChange.clear(); this.lastFedGroup.clear(); this.initAppliedGroup.clear();
     this.cmafHoldingForAttach = false; this.keyedCmafIdentity = false;
     this.installedCmafInit.clear(); this.cmafPreInitDropWarned.clear();
     this.locmafDecoders.clear(); this.locmafDecoderInit.clear(); this.locmafHealth.clear();
@@ -5259,22 +5262,29 @@ export class MoqtPlayer {
         // its first group with one): it applies from here, in stream order,
         // whatever the catalog's arrival. The objects after it wait for it.
         const running = this.runningInitBytes(media);
-        if (running !== undefined && bytesEqual(running, obj.payload)) return; // Already this initialization.
+        if (running !== undefined && bytesEqual(running, obj.payload)) { this.discardMediaInput(input, 'retype'); return; } // Already this initialization.
         let change = initChange;
         if (!change) {
             change = { trackName, codec: this.subscribedTrack(media)?.codec ?? '', init: obj.payload.slice(), fromGroup: group,
-              applying: false, held: [], owner: this.inBandInitOwner };
+              applying: false, held: [], via: 'in band' };
             this.pendingInitChange.set(media, change);
         } else if (!change.applying) {
-            change.init = obj.payload.slice(); change.fromGroup = group;
+            change.init = obj.payload.slice(); change.fromGroup = group; change.via = 'in band';
         }
         if (!change.applying) {
             change.applying = true;
             void this.applyInitChange(media, change, group);
         }
+        this.discardMediaInput(input, 'retype'); // Consumed as the initialization, not media.
         return;
       }
       if (media && !initChange) {
+        // A late object of a group before the one an initialization was applied at.
+        const applied = this.initAppliedGroup.get(media);
+        if (applied && applied.trackName === trackName && group < applied.groupId) {
+          this.discardMediaInput(input, 'stale group');
+          return;
+        }
         // A group before the track's current initialization (a viewer joining
         // between a key change's catalog and its first group, or a rebuild)
         // would be decrypted with the wrong key.
@@ -17146,7 +17156,7 @@ export class MoqtPlayer {
       const ownsOutput = this.ownedSeekOutput === output;
       const ownsAssembler = this.cmafAssembler === output.assembler;
       if (ownsOutput) { this.ownedSeekOutput = null; this.ownedSeekTransformAliases = null; }
-      if (ownsAssembler) { this.cmafAssembler = null; this.cmafInitialized = false; this.pendingInitChange.clear(); this.lastFedGroup.clear(); }
+      if (ownsAssembler) { this.cmafAssembler = null; this.cmafInitialized = false; this.pendingInitChange.clear(); this.lastFedGroup.clear(); this.initAppliedGroup.clear(); }
       if (this.mseOutputEpoch === attempt.epoch) this.mseOutputEpoch = null;
       this.seekPosition?.retire(attempt.epoch);
       for (const [role, completion] of this.mseCompletions ?? []) {
