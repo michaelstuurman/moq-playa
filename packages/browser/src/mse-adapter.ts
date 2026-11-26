@@ -2531,7 +2531,9 @@ export class MseMediaSource implements MediaSourceLike {
     // reused: the browser did not take that key for this content. Drop the
     // session and request a license from the content's own initialization.
     if (event.type === 'waitingforkey' && this.prelicensedReuses.length > 0) {
-      const recent = this.prelicensedReuses.filter((r) => performance.now() - r.at < 5000);
+      // The playhead reaches the new initialization a buffer length after the
+      // reuse, later still after a stall or in a background tab: a wide window.
+      const recent = this.prelicensedReuses.filter((r) => performance.now() - r.at < 60_000);
       this.prelicensedReuses = [];
       for (const r of recent) {
         if (!this.keySessions.has(r.session)) continue;
