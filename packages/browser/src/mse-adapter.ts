@@ -2523,7 +2523,24 @@ export class MseMediaSource implements MediaSourceLike {
     }, 50);
   }
 
+  /** Sessions licensed ahead that were just reused for arriving content (see handleWaitingForKey). */
+  private prelicensedReuses: Array<{ session: MediaKeySession; initDataType: string; initData: Uint8Array; at: number }> = [];
+
   private handleWaitingForKey = (event: Event): void => {
+    // The element waits for a key right after a key licensed ahead was
+    // reused: the browser did not take that key for this content. Drop the
+    // session and request a license from the content's own initialization.
+    if (event.type === 'waitingforkey' && this.prelicensedReuses.length > 0) {
+      const recent = this.prelicensedReuses.filter((r) => performance.now() - r.at < 5000);
+      this.prelicensedReuses = [];
+      for (const r of recent) {
+        if (!this.keySessions.has(r.session)) continue;
+        this.logWarn('[DRM] key licensed ahead was not used (waitingforkey); requesting a license frma=%s', describeFrma(r.initData));
+        this.retireKeySession(r.session);
+        void this.handleEncrypted({ initDataType: r.initDataType, initData: r.initData.buffer.slice(
+          r.initData.byteOffset, r.initData.byteOffset + r.initData.byteLength) } as MediaEncryptedEvent);
+      }
+    }
     // WebKit's prefixed webkitneedkey carries the track's initData too.
     const raw = (event as Event & { initData?: ArrayBuffer | Uint8Array }).initData;
     const initData = raw ? new Uint8Array(raw instanceof Uint8Array ? raw : new Uint8Array(raw)) : null;
@@ -2574,9 +2591,14 @@ export class MseMediaSource implements MediaSourceLike {
       const reuse = cache ? this.retainKeySession((revoke) =>
         cache.acquire(partition, event.initDataType, initData, revoke)) : null;
       if (reuse) {
-        this.logDebug('[DRM] encrypted: reusing a usable cached session');
+        this.logDebug('[DRM] encrypted: reusing a usable cached session%s', reuse.entry.prelicensed ? ' (licensed ahead)' : '');
         // Already licensed and usable: no generateRequest, no license POST.
         this.holdKeySession(reuse.entry.session, event.initDataType, initData, reuse);
+        // A key licensed ahead that the browser then does not use shows as
+        // waitingforkey: see handleWaitingForKey.
+        if (reuse.entry.prelicensed) {
+          this.prelicensedReuses.push({ session: reuse.entry.session, initDataType: event.initDataType, initData, at: performance.now() });
+        }
         return;
       }
       this.logDebug('[DRM] creating a session frma=%s', describeFrma(initData));

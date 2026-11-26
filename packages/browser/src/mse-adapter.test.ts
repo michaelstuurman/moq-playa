@@ -4453,6 +4453,35 @@ describe('MseMediaSource DRM lifecycle', () => {
                 // Already licensed ahead: asking again requests nothing.
                 await expect(cache.prelicenseFairplay(drm, new Map([[hexKid(0xa), hexKid(0xb)]]))).resolves.toBe(1);
                 expect(env.sessions).toHaveLength(sessions);
+                // The browser does not take that key (waitingforkey right after the reuse):
+                // the session is dropped and the content's own sinf requests a license.
+                env.video.dispatch({ type: 'waitingforkey' } as unknown as Event);
+                await settle();
+                expect(next.close).toHaveBeenCalled();
+                expect(env.sessions).toHaveLength(sessions + 1);
+                const fallback = env.sessions.at(-1)!;
+                expect(sinfKeyId(new Uint8Array(fallback.generateRequest.mock.calls[0]![1] as Uint8Array))).toBe(hexKid(0xb));
+                expect(new TextDecoder().decode(new Uint8Array(fallback.generateRequest.mock.calls[0]![1] as Uint8Array)))
+                    .toBe(new TextDecoder().decode(sinf(0xb, 'avc3')));
+                cache.close();
+            });
+
+            it('a track\'s own session is still matched by bytes: video and audio sharing a key each request', async () => {
+                const cache = new DrmSessionCache();
+                const certificate = Uint8Array.of(9);
+                const env = setup(certificate, undefined, { keySystem: 'com.apple.fps', sessionCache: cache });
+                vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) })));
+                const encrypted = async (data: Uint8Array) => {
+                    env.video.dispatch({ type: 'encrypted', initDataType: 'sinf', initData: data.slice().buffer } as unknown as Event);
+                    await settle();
+                };
+                await encrypted(sinf(0xa, 'avc1'));
+                const video = env.sessions.at(-1)!;
+                env.message(video); await settle();
+                video.setStatus(0xa, 'usable');
+                await encrypted(sinf(0xa, 'mp4a')); // same key ID, the audio track's own sinf
+                expect(env.sessions).toHaveLength(2);
+                expect(env.sessions[1]!.generateRequest).toHaveBeenCalledTimes(1);
                 cache.close();
             });
         });

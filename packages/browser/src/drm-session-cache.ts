@@ -37,6 +37,8 @@ export interface DrmCachedSession {
   usable: boolean;
   /** Revocation callback of the adapter holding the session; null when idle. */
   holder: (() => void) | null;
+  /** Licensed ahead of its content (prelicense). Only such a FairPlay session is matched by key ID. */
+  prelicensed?: boolean;
 }
 
 /**
@@ -123,7 +125,10 @@ export class DrmSessionCache {
     const wanted = initDataKeyIds(initDataType, initData);
     for (const entry of this.entries) {
       if (entry.partition !== partition || !entry.usable) continue;
-      const covers = wanted.size > 0
+      // FairPlay `sinf`: by key ID only for a session licensed ahead; a
+      // track's own session is still matched by its exact bytes (video and
+      // audio sharing one key each need their own request in Safari).
+      const covers = wanted.size > 0 && (initDataType !== 'sinf' || entry.prelicensed === true)
         ? [...wanted].every((id) => entry.keyIds.has(id))
         : entry.initDataType === initDataType && equalBytes(entry.initData, initData);
       if (!covers) continue;
@@ -179,12 +184,14 @@ export class DrmSessionCache {
     const keys = this.partitions.get(partition);
     if (!keys) return false;
     for (const entry of this.entries) {
-      if (entry.partition === partition && entry.usable && [...wanted].every((id) => entry.keyIds.has(id))) return true;
+      if (entry.partition === partition && entry.usable && (!fairplay || entry.prelicensed === true)
+          && [...wanted].every((id) => entry.keyIds.has(id))) return true;
     }
     const data = initData.slice();
     const session = keys.createSession('temporary');
     const revoke = (): void => { /* Another adapter took it over: nothing held here to stop. */ };
     const entry = this.track(partition, session, initDataType, data, revoke);
+    if (entry) entry.prelicensed = true;
     if (!entry) {
       try { void session.close().catch(() => {}); } catch { /* not opened */ }
       return false;
@@ -314,7 +321,7 @@ export class DrmSessionCache {
     }
     entry.usable = usable && entry.keyIds.size > 0;
     // FairPlay: the key the request named, whatever form the CDM reports it in.
-    if (entry.initDataType === 'sinf') { const kid = sinfKeyId(entry.initData); if (kid) entry.keyIds.add(kid); }
+    if (entry.initDataType === 'sinf' && entry.prelicensed) { const kid = sinfKeyId(entry.initData); if (kid) entry.keyIds.add(kid); }
   }
 
   private evict(): void {
@@ -441,14 +448,27 @@ function sinfBoxes(initData: Uint8Array): Uint8Array[] | null {
   }
 }
 
-/** Offset of `tenc`'s default_KID in a `sinf` box, or -1. */
-function tencKidOffset(sinf: Uint8Array): number {
-  for (let i = 4; i + 4 <= sinf.byteLength; i++) {
-    if (sinf[i] === 0x74 && sinf[i + 1] === 0x65 && sinf[i + 2] === 0x6e && sinf[i + 3] === 0x63) {
-      return i + 12 + 16 <= sinf.byteLength ? i + 12 : -1;
-    }
+/** A child box of `type` within [from, to), by box boundaries: [payload start, box end), or null. */
+function childBox(bytes: Uint8Array, from: number, to: number, type: string): [number, number] | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let at = from;
+  while (at + 8 <= to) {
+    const size = view.getUint32(at);
+    if (size < 8 || at + size > to) return null;
+    if (ascii(bytes, at + 4, 4) === type) return [at + 8, at + size];
+    at += size;
   }
-  return -1;
+  return null;
+}
+
+/** Offset of `tenc`'s default_KID in a `sinf` box (sinf > schi > tenc), or -1. */
+function tencKidOffset(sinf: Uint8Array): number {
+  const outer = childBox(sinf, 0, sinf.byteLength, 'sinf');
+  const schi = outer && childBox(sinf, outer[0], outer[1], 'schi');
+  // Some sources give the sinf's children without the schi wrapper.
+  const tenc = outer && (schi ? childBox(sinf, schi[0], schi[1], 'tenc') : childBox(sinf, outer[0], outer[1], 'tenc'));
+  // FullBox header (4), reserved and pattern (2), isProtected (1), IV size (1), then the KID.
+  return tenc && tenc[0] + 8 + 16 <= tenc[1] ? tenc[0] + 8 : -1;
 }
 
 /** @internal The key ID (`tenc` default_KID, lowercase hex) FairPlay `sinf` initialization data names. */
