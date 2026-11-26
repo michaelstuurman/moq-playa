@@ -1069,6 +1069,8 @@ export class MoqtPlayer {
    * arriving while it is applied are held in order.
    */
   private readonly pendingInitChange = new Map<'video' | 'audio', PendingInitChange>();
+  /** One retype-fence owner for in-band initialization changes: video and audio change together. */
+  private readonly inBandInitOwner = {};
   /** Per media type: the newest group ID fed toward MSE, for in-place initialization changes. */
   private readonly lastFedGroup = new Map<'video' | 'audio', { trackName: string; groupId: bigint }>();
 
@@ -2598,6 +2600,10 @@ export class MoqtPlayer {
     if (!changed) {
       const owner = {};
       for (const { mediaType, ...change } of initChanges) {
+        // Already running or being applied (it came in band, ahead of this catalog).
+        const running = this.runningInitBytes(mediaType), inflight = this.pendingInitChange.get(mediaType);
+        if ((running !== undefined && bytesEqual(running, change.init))
+            || (inflight !== undefined && bytesEqual(inflight.init, change.init))) continue;
         const fed = this.lastFedGroup.get(mediaType);
         // Media of the new initialization already went in with the old one
         // (the catalog arrived after it): rebuild playback instead.
@@ -5247,6 +5253,26 @@ export class MoqtPlayer {
         // This media type now plays another track: the change was for the one it left.
         this.pendingInitChange.delete(media);
         initChange = undefined;
+      }
+      if (media && this.cmafInitialized && MoqtPlayer.looksLikeCmafInitSegment(obj.payload)) {
+        // An init segment in band on a playing track (a DRM key change starts
+        // its first group with one): it applies from here, in stream order,
+        // whatever the catalog's arrival. The objects after it wait for it.
+        const running = this.runningInitBytes(media);
+        if (running !== undefined && bytesEqual(running, obj.payload)) return; // Already this initialization.
+        let change = initChange;
+        if (!change) {
+            change = { trackName, codec: this.subscribedTrack(media)?.codec ?? '', init: obj.payload.slice(), fromGroup: group,
+              applying: false, held: [], owner: this.inBandInitOwner };
+            this.pendingInitChange.set(media, change);
+        } else if (!change.applying) {
+            change.init = obj.payload.slice(); change.fromGroup = group;
+        }
+        if (!change.applying) {
+            change.applying = true;
+            void this.applyInitChange(media, change, group);
+        }
+        return;
       }
       if (media && !initChange) {
         // A group before the track's current initialization (a viewer joining

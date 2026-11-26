@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MoqtPlayerConfig } from './config.js';
 import { encodeLocHeaders, locWireProfileForDraft } from '@openmoq/loc';
 import { CmafAssembler } from '../../browser/src/cmaf-assembler.js';
-import { SYNC_FLAGS, audioInit, buildChunk, videoInit } from '../../locmaf/test-support/cmaf.js';
+import { SYNC_FLAGS, audioInit, buildChunk, cencVideoInit, videoInit } from '../../locmaf/test-support/cmaf.js';
 import type { CatalogState } from '@openmoq/msf';
 import { catToken } from '@openmoq/webtransport';
 import { MoqtConnection } from '@openmoq/webtransport';
@@ -201,6 +201,23 @@ describe('in-place initialization changes (DRM key rotation)', () => {
       await send(6n);
       expect(appends).toContain(6n);
       expect(changes).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('applies an init segment in band at its group, and the catalog that follows changes nothing', async () => {
+    const { f, changes, appends, destroyedSources } = await cmafFixture();
+    try {
+      const next = cencVideoInit(8);
+      const stream = await f.server.openSubgroup(200n, 6n, 0n, { publisherPriority: 128 });
+      await f.server.sendObject(stream, 0n, next);
+      await f.server.sendObject(stream, 1n, chunk(18000)); await flush(256);
+      expect(changes).toEqual([['video', 'avc1.640028', next, { keepQueued: true }]]);
+      expect(appends).toContain(6n);
+      await f.update({ initData: b64(next), initFromGroup: 6 }); // the catalog arrives after the media
+      expect(changes).toHaveLength(1);
+      expect(f.requests.filter(r => r.name === 'v')).toHaveLength(1);
+      expect(destroyedSources).toEqual([]);
+      expect(f.errors).toEqual([]);
     } finally { await f.close(); }
   });
 
