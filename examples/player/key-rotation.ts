@@ -56,6 +56,49 @@ export function announcedKeys(catalogText: string, systemId: string): AnnouncedK
     return [...out.values()];
 }
 
+/** A key in use and the key that follows it, as lowercase hex key IDs. */
+export interface AnnouncedChange {
+    readonly current: string;
+    readonly next: string;
+    /** When `next` takes effect, Unix milliseconds. */
+    readonly validFrom: number;
+}
+
+/**
+ * Per key in use, the announced key that follows it, from any DRM system's
+ * entries (a key ID is the same for every system). For FairPlay, which
+ * licenses by key ID.
+ */
+export function announcedChanges(catalogText: string): AnnouncedChange[] {
+    let catalog: unknown;
+    try {
+        catalog = JSON.parse(catalogText);
+    } catch {
+        return [];
+    }
+    if (typeof catalog !== 'object' || catalog === null) return [];
+    const root = catalog as { tracks?: unknown; contentProtections?: unknown };
+    if (!Array.isArray(root.tracks) || !Array.isArray(root.contentProtections)) return [];
+    const kids = new Map<string, string>();
+    for (const cp of root.contentProtections as Array<Record<string, unknown>>) {
+        const list = cp?.['defaultKID'];
+        if (typeof cp?.['refID'] === 'string' && Array.isArray(list) && typeof list[0] === 'string') {
+            kids.set(cp['refID'], list[0].toLowerCase().replace(/-/g, ''));
+        }
+    }
+    const out = new Map<string, AnnouncedChange>();
+    for (const track of root.tracks as Array<Record<string, unknown>>) {
+        const now = track?.['contentProtectionRefIDs'], after = track?.['nextContentProtectionRefIDs'];
+        const validFrom = typeof track?.['nextKeyValidFrom'] === 'string' ? Date.parse(track['nextKeyValidFrom']) : NaN;
+        if (!Array.isArray(now) || !Array.isArray(after) || !Number.isFinite(validFrom)) continue;
+        const current = kids.get(String(now[0])), next = kids.get(String(after[0]));
+        if (current && next && current !== next && /^[0-9a-f]{32}$/.test(current) && /^[0-9a-f]{32}$/.test(next) && !out.has(current)) {
+            out.set(current, { current, next, validFrom });
+        }
+    }
+    return [...out.values()];
+}
+
 /**
  * When to license an announced key: `leadMs` before it takes effect, spread
  * over up to `spreadMs` earlier so viewers do not all ask at once; at once

@@ -26,11 +26,12 @@ import { varint } from '@openmoq/transport';
 import { MoqtConnection } from '@openmoq/webtransport';
 import { createLoopback, flush as flushWire } from '../../webtransport/src/testkit/loopback.js';
 import { CmafAssembler } from './cmaf-assembler.js';
-import { DrmSessionCache, initDataKeyIds } from './drm-session-cache.js';
+import { DrmSessionCache, initDataKeyIds, sinfKeyId, sinfWithKeyId } from './drm-session-cache.js';
 import type { DrmConfig, MseStartupReport, MseMediaSourceOptions } from './mse-adapter.js';
 
 // ─── Shared byte-building helpers (subset from mp4-box.test.ts) ──
 
+const RealURL = globalThis.URL;
 function cat(...parts: Uint8Array[]): Uint8Array {
     const total = parts.reduce((n, p) => n + p.byteLength, 0);
     const out = new Uint8Array(total);
@@ -4387,6 +4388,71 @@ describe('MseMediaSource DRM lifecycle', () => {
                 message(session);
                 await expect(done).rejects.toThrow('403');
                 expect(session.close).toHaveBeenCalled();
+                cache.close();
+            });
+        });
+
+        describe('FairPlay prelicense by key ID (key rotation)', () => {
+            /** FairPlay `sinf` initialization data: a sinf with frma and a tenc naming sixteen `kid` bytes. */
+            function sinf(kid: number, frma = 'avc1'): Uint8Array {
+                const text = (t: string) => Uint8Array.from(t, (c) => c.charCodeAt(0));
+                const tenc = cat(u32(32), text('tenc'), u32(0x01000000), Uint8Array.of(0, 0x19, 1, 0), new Uint8Array(16).fill(kid));
+                const box = cat(u32(8 + 12 + tenc.length), text('sinf'), u32(12), text('frma'), text(frma), tenc);
+                return new TextEncoder().encode(JSON.stringify({ sinf: [btoa(String.fromCharCode(...box))] }));
+            }
+            const hexKid = (kid: number) => kid.toString(16).padStart(2, '0').repeat(16);
+
+            it('reads and replaces the key ID of a sinf', () => {
+                expect(sinfKeyId(sinf(0xa))).toBe(hexKid(0xa));
+                const next = sinfWithKeyId(sinf(0xa, 'mp4a'), hexKid(0xb))!;
+                expect(sinfKeyId(next)).toBe(hexKid(0xb));
+                expect(new TextDecoder().decode(next)).toContain('"sinf"');
+                expect([...initDataKeyIds('sinf', next)]).toEqual([hexKid(0xb)]);
+                expect(sinfWithKeyId(sinf(0xa), 'nothex')).toBeNull();
+                expect(sinfWithKeyId(new TextEncoder().encode('{"sinf":["AAAA"]}'), hexKid(0xb))).toBeNull();
+            });
+
+            it('licenses the next key from the playing track\'s request, and the key change reuses it', async () => {
+                const cache = new DrmSessionCache();
+                const certificate = Uint8Array.of(9);
+                const drm = { licenseUrl: 'https://license.example.invalid/fps', keySystem: 'com.apple.fps', serverCertificate: certificate };
+                const env = setup(certificate, undefined, { keySystem: 'com.apple.fps', licenseUrl: drm.licenseUrl, sessionCache: cache });
+                const fetchLicense = vi.fn(async (_url: string, _init: RequestInit) => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) }));
+                vi.stubGlobal('fetch', fetchLicense);
+                // The file's URL stub only makes object URLs; license URLs need the real class.
+                vi.stubGlobal('URL', Object.assign(RealURL, { createObjectURL: () => 'blob:mock', revokeObjectURL: () => {} }));
+                const encrypted = async (data: Uint8Array) => {
+                    env.video.dispatch({ type: 'encrypted', initDataType: 'sinf', initData: data.slice().buffer } as unknown as Event); // exact buffer, not the encoder's pool
+                    await settle();
+                };
+                // The key in use: requested from the track's own sinf.
+                await encrypted(sinf(0xa));
+                const current = env.sessions.at(-1)!;
+                env.message(current); await settle();
+                current.setStatus(0xa, 'usable');
+                expect(String(fetchLicense.mock.calls[0]![0])).toContain(`kid=${hexKid(0xa)}`);
+                // Nothing to do without a successor.
+                await expect(cache.prelicenseFairplay(drm, new Map([[hexKid(0xc), hexKid(0xd)]]))).resolves.toBe(0);
+                // The next key, ahead of its content.
+                const ahead = cache.prelicenseFairplay(drm, new Map([[hexKid(0xa), hexKid(0xb)]]));
+                await settle();
+                const next = env.sessions.at(-1)!;
+                expect(next).not.toBe(current);
+                const requested = new Uint8Array(next.generateRequest.mock.calls[0]![1] as Uint8Array);
+                expect(next.generateRequest.mock.calls[0]![0]).toBe('sinf');
+                expect(sinfKeyId(requested)).toBe(hexKid(0xb));
+                env.message(next); await settle();
+                next.setStatus(0xb, 'usable');
+                await expect(ahead).resolves.toBe(1);
+                expect(String(fetchLicense.mock.calls[1]![0])).toContain(`kid=${hexKid(0xb)}`);
+                // The key change: the new init names key B (other bytes than the request): no new session, no license.
+                const sessions = env.sessions.length, posts = fetchLicense.mock.calls.length;
+                await encrypted(sinf(0xb, 'avc3'));
+                expect(env.sessions).toHaveLength(sessions);
+                expect(fetchLicense).toHaveBeenCalledTimes(posts);
+                // Already licensed ahead: asking again requests nothing.
+                await expect(cache.prelicenseFairplay(drm, new Map([[hexKid(0xa), hexKid(0xb)]]))).resolves.toBe(1);
+                expect(env.sessions).toHaveLength(sessions);
                 cache.close();
             });
         });

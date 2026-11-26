@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseMsfCatalog } from '@openmoq/msf';
-import { MAX_TIMEOUT_MS, afterDelay, announcedKeys, prelicenseDelay } from './key-rotation.js';
+import { MAX_TIMEOUT_MS, afterDelay, announcedChanges, announcedKeys, prelicenseDelay } from './key-rotation.js';
 
 const WV = 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed';
 const CK = '1077efec-c0b2-4d02-ace3-3c1e52e2fb4b';
@@ -84,5 +84,27 @@ describe('afterDelay', () => {
         stop = true;
         while (pending.length) pending.shift()!();
         expect(ran).toBe(1);
+    });
+});
+
+describe('announced key changes by key ID (FairPlay)', () => {
+    it('pairs each key in use with the key that follows it', () => {
+        const text = catalog([
+            { name: 'v', contentProtectionRefIDs: ['1'], nextContentProtectionRefIDs: ['next-3'], nextKeyValidFrom: '2026-11-26T12:00:00Z' },
+            { name: 'v2', contentProtectionRefIDs: ['1'], nextContentProtectionRefIDs: ['next-3'], nextKeyValidFrom: '2026-11-26T12:00:00Z' },
+            { name: 'a', contentProtectionRefIDs: ['2'], nextContentProtectionRefIDs: ['next-4'], nextKeyValidFrom: '2026-11-26T12:00:00Z' },
+            { name: 'clear' },
+        ], [
+            cp('1', 'AAAAAAAA-0000-0000-0000-000000000000', WV),
+            cp('2', 'cccccccc-0000-0000-0000-000000000000', WV),
+            cp('next-3', 'bbbbbbbb-0000-0000-0000-000000000000', WV),
+            cp('next-4', 'dddddddd-0000-0000-0000-000000000000', WV),
+        ]);
+        expect(announcedChanges(text)).toEqual([
+            { current: 'aaaaaaaa000000000000000000000000', next: 'bbbbbbbb000000000000000000000000', validFrom: Date.parse('2026-11-26T12:00:00Z') },
+            { current: 'cccccccc000000000000000000000000', next: 'dddddddd000000000000000000000000', validFrom: Date.parse('2026-11-26T12:00:00Z') },
+        ]);
+        expect(announcedChanges(catalog([{ name: 'v', contentProtectionRefIDs: ['1'] }], [cp('1', 'aaaaaaaa-0000-0000-0000-000000000000', WV)]))).toEqual([]);
+        expect(announcedChanges('{')).toEqual([]);
     });
 });

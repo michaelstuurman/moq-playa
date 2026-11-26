@@ -46,7 +46,7 @@ import { renderTrackMenus, playbackOwnerIsCurrent, selectionMenus, updateSelecti
     type PresentationChoice } from './selection-controls.js';
 import { TeardownBarrier, ViewRetuner, parseVideoAltGroup, waitForOutput } from './view-selection.js';
 import { readMsfLink, type PlayerMsfLink } from './msf-link.js';
-import { afterDelay, announcedKeys, prelicenseDelay } from './key-rotation.js';
+import { afterDelay, announcedChanges, announcedKeys, prelicenseDelay } from './key-rotation.js';
 
 // ─── Settings Modal ──────────────────────────────────────────────────
 
@@ -1672,6 +1672,29 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
                     );
                 }, () => !playbackOwnerIsCurrent(p, epoch, player, playEpoch));
             }
+        });
+    }
+    // FairPlay licenses by key ID: from the playing tracks' own requests, with
+    // the announced next key ID in place (DrmSessionCache.prelicenseFairplay).
+    if (drmConfig && drmConfig.keySystem?.startsWith('com.apple.fps') && prelicenseMinutes > 0) {
+        const scheduled = new Set<string>();
+        on('catalog_raw', (e) => {
+            if (!e.text) return;
+            const changes = announcedChanges(e.text).filter((c) => !scheduled.has(c.next));
+            if (changes.length === 0) return;
+            for (const c of changes) scheduled.add(c.next);
+            const delay = prelicenseDelay(changes[0]!.validFrom, Date.now(), prelicenseMinutes * 60_000, 60_000, Math.random());
+            log(`[DRM] next keys ${changes.map((c) => c.next).join(', ')} from ${new Date(changes[0]!.validFrom).toISOString()}: FairPlay license in ${Math.round(delay / 1000)} s`);
+            const next = new Map(changes.map((c) => [c.current, c.next] as const));
+            // The sessions of the keys in use may still be starting: try a few times.
+            const attempt = (left: number): void => {
+                if (!playbackOwnerIsCurrent(p, epoch, player, playEpoch)) return;
+                drmSessionCache.prelicenseFairplay(drmConfig, next).then((count) => {
+                    if (count >= next.size || left === 0) log(`[DRM] FairPlay: ${count} of ${next.size} next keys licensed ahead`);
+                    else setTimeout(() => attempt(left - 1), 3000);
+                }, (err) => log(`[DRM] FairPlay next key license failed: ${String(err)}`));
+            };
+            afterDelay(delay, () => attempt(3), () => !playbackOwnerIsCurrent(p, epoch, player, playEpoch));
         });
     }
 

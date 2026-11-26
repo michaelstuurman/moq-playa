@@ -169,7 +169,10 @@ export class DrmSessionCache {
   async prelicense(drm: PrelicenseConfig, initDataType: string, initData: Uint8Array,
       options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<boolean> {
     const keySystem = drm.keySystem ?? 'com.widevine.alpha';
-    if (this.isClosed || keySystem.startsWith('com.apple.fps') || initDataType !== 'cenc') return false;
+    const fairplay = keySystem.startsWith('com.apple.fps');
+    // Widevine and others license from `cenc` (pssh); FairPlay from a `sinf`
+    // naming the key (see prelicenseFairplay).
+    if (this.isClosed || initDataType !== (fairplay ? 'sinf' : 'cenc')) return false;
     const wanted = initDataKeyIds(initDataType, initData);
     if (wanted.size === 0) return false;
     const partition = drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate);
@@ -198,7 +201,8 @@ export class DrmSessionCache {
       const failed = new Promise<never>((_, reject) => {
         onMessage = (event: MediaKeyMessageEvent): void => {
           void (async () => {
-            const response = await fetch(drm.licenseUrl, { method: 'POST', body: event.message, signal: abort.signal });
+            const url = fairplay ? fairplayKeyUrl(drm.licenseUrl, [...wanted][0]!) : drm.licenseUrl;
+            const response = await fetch(url, { method: 'POST', body: event.message, signal: abort.signal });
             if (!response.ok) throw new Error(`License server returned ${response.status} ${response.statusText}`);
             await session.update(new Uint8Array(await response.arrayBuffer()));
           })().catch(reject);
@@ -234,6 +238,34 @@ export class DrmSessionCache {
       options.signal?.removeEventListener('abort', onAbort);
       if (this.entries.has(entry)) this.release(entry, revoke);
     }
+  }
+
+  /**
+   * FairPlay: license the keys that follow the ones in use (key rotation).
+   * `next` maps a key ID in use to the one that follows it, lowercase hex.
+   * Safari requests a FairPlay license from a track's `sinf`, and matches a
+   * licensed key to later content by the key ID in it, across sessions. So
+   * for every retained usable FairPlay session whose key has a successor,
+   * this requests a license from that session's `sinf` with the next key ID
+   * in its place (video and audio each keep their own `sinf`). Resolves the
+   * number of keys now licensed ahead; 0 when no session is usable yet.
+   */
+  async prelicenseFairplay(drm: PrelicenseConfig, next: ReadonlyMap<string, string>,
+      options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<number> {
+    const keySystem = drm.keySystem ?? '';
+    if (this.isClosed || !keySystem.startsWith('com.apple.fps')) return 0;
+    const partition = drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate);
+    const requests: Uint8Array[] = [];
+    for (const entry of this.entries) {
+      if (entry.partition !== partition || !entry.usable || entry.initDataType !== 'sinf') continue;
+      const current = sinfKeyId(entry.initData);
+      const following = current === null ? undefined : next.get(current);
+      const initData = following === undefined ? null : sinfWithKeyId(entry.initData, following);
+      if (initData) requests.push(initData);
+    }
+    let licensed = 0;
+    for (const initData of requests) if (await this.prelicense(drm, 'sinf', initData, options)) licensed++;
+    return licensed;
   }
 
   /** @internal The holder is done. A session not yet usable is closed. */
@@ -281,6 +313,8 @@ export class DrmSessionCache {
       return;
     }
     entry.usable = usable && entry.keyIds.size > 0;
+    // FairPlay: the key the request named, whatever form the CDM reports it in.
+    if (entry.initDataType === 'sinf') { const kid = sinfKeyId(entry.initData); if (kid) entry.keyIds.add(kid); }
   }
 
   private evict(): void {
@@ -304,6 +338,11 @@ export function drmPartition(keySystem: string, licenseUrl: string, certificate:
  */
 export function initDataKeyIds(initDataType: string, initData: Uint8Array): Set<string> {
   const ids = new Set<string>();
+  if (initDataType === 'sinf') {
+    const kid = sinfKeyId(initData);
+    if (kid) ids.add(kid);
+    return ids;
+  }
   if (initDataType !== 'cenc') return ids;
   const view = new DataView(initData.buffer, initData.byteOffset, initData.byteLength);
   let offset = 0;
@@ -388,4 +427,62 @@ function hex(bytes: Uint8Array): string {
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((byte, i) => byte === b[i]);
+}
+
+/** The `sinf` boxes of FairPlay `sinf` initialization data (JSON `{"sinf":[base64,...]}`), or the raw boxes. */
+function sinfBoxes(initData: Uint8Array): Uint8Array[] | null {
+  try {
+    const json = JSON.parse(new TextDecoder().decode(initData)) as { sinf?: unknown };
+    const list = Array.isArray(json.sinf) ? json.sinf : typeof json.sinf === 'string' ? [json.sinf] : null;
+    if (!list || list.some((item) => typeof item !== 'string')) return null;
+    return (list as string[]).map((item) => Uint8Array.from(atob(item), (c) => c.charCodeAt(0)));
+  } catch {
+    return [initData];
+  }
+}
+
+/** Offset of `tenc`'s default_KID in a `sinf` box, or -1. */
+function tencKidOffset(sinf: Uint8Array): number {
+  for (let i = 4; i + 4 <= sinf.byteLength; i++) {
+    if (sinf[i] === 0x74 && sinf[i + 1] === 0x65 && sinf[i + 2] === 0x6e && sinf[i + 3] === 0x63) {
+      return i + 12 + 16 <= sinf.byteLength ? i + 12 : -1;
+    }
+  }
+  return -1;
+}
+
+/** @internal The key ID (`tenc` default_KID, lowercase hex) FairPlay `sinf` initialization data names. */
+export function sinfKeyId(initData: Uint8Array): string | null {
+  const first = sinfBoxes(initData)?.[0];
+  const at = first ? tencKidOffset(first) : -1;
+  return first && at >= 0 ? hex(first.subarray(at, at + 16)) : null;
+}
+
+/** @internal The same `sinf` initialization data naming another key ID (32 hex digits); null if it cannot be built. */
+export function sinfWithKeyId(initData: Uint8Array, keyId: string): Uint8Array | null {
+  const boxes = sinfBoxes(initData);
+  if (!boxes || boxes.length === 0 || !/^[0-9a-f]{32}$/.test(keyId)) return null;
+  const out: string[] = [];
+  for (const box of boxes) {
+    const at = tencKidOffset(box);
+    if (at < 0) return null;
+    const copy = box.slice();
+    for (let i = 0; i < 16; i++) copy[at + i] = parseInt(keyId.slice(2 * i, 2 * i + 2), 16);
+    out.push(btoa(String.fromCharCode(...copy)));
+  }
+  return new TextEncoder().encode(JSON.stringify({ sinf: out }));
+}
+
+/** The FairPlay license URL of one key: the configured URL plus `kid`, unless it names one. */
+function fairplayKeyUrl(licenseUrl: string, keyId: string): string {
+  try {
+    // An absolute URL needs no base; a page without a usable location must not lose `kid`.
+    let url: URL;
+    try { url = new URL(licenseUrl); } catch { url = new URL(licenseUrl, globalThis.location?.href); }
+    if (url.searchParams.has('kid')) return licenseUrl;
+    url.searchParams.set('kid', keyId);
+    return url.toString();
+  } catch {
+    return licenseUrl;
+  }
 }
