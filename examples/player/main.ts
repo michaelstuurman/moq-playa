@@ -1684,12 +1684,13 @@ async function startPlaybackAttempt(epoch: number, transportAbort: AbortControll
             if (changes.length === 0) return;
             for (const c of changes) scheduled.add(c.next);
             const delay = prelicenseDelay(changes[0]!.validFrom, Date.now(), prelicenseMinutes * 60_000, 60_000, Math.random());
+            log(`[DRM] key changes ${changes.map((c) => `${c.current}>${c.next}`).join(', ')}`);
             log(`[DRM] next keys ${changes.map((c) => c.next).join(', ')} from ${new Date(changes[0]!.validFrom).toISOString()}: FairPlay license in ${Math.round(delay / 1000)} s`);
             const next = new Map(changes.map((c) => [c.current, c.next] as const));
             // The sessions of the keys in use may still be starting: try a few times.
             const attempt = (left: number): void => {
                 if (!playbackOwnerIsCurrent(p, epoch, player, playEpoch)) return;
-                drmSessionCache.prelicenseFairplay(drmConfig, next).then((count) => {
+                drmSessionCache.prelicenseFairplay(drmConfig, next, left === 0 ? { log: (line) => log(`[DRM] ${line}`) } : {}).then((count) => {
                     if (count >= next.size || left === 0) log(`[DRM] FairPlay: ${count} of ${next.size} next keys licensed ahead`);
                     else setTimeout(() => attempt(left - 1), 3000);
                 }, (err) => log(`[DRM] FairPlay next key license failed: ${String(err)}`));

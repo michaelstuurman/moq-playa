@@ -258,17 +258,23 @@ export class DrmSessionCache {
    * number of keys now licensed ahead; 0 when no session is usable yet.
    */
   async prelicenseFairplay(drm: PrelicenseConfig, next: ReadonlyMap<string, string>,
-      options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<number> {
+      options: { signal?: AbortSignal; timeoutMs?: number; log?: (line: string) => void } = {}): Promise<number> {
     const keySystem = drm.keySystem ?? '';
     if (this.isClosed || !keySystem.startsWith('com.apple.fps')) return 0;
     const partition = drmPartition(keySystem, drm.licenseUrl, drm.serverCertificate);
     const requests: Uint8Array[] = [];
+    // Why a session yields no request, for the page log: no key material, only key IDs and box bytes.
+    const note = options.log;
+    if (note && this.entries.size === 0) note('prelicense: no retained sessions');
     for (const entry of this.entries) {
-      if (entry.partition !== partition || !entry.usable || entry.initDataType !== 'sinf') continue;
-      const current = sinfKeyId(entry.initData);
+      const current = entry.initDataType === 'sinf' ? sinfKeyId(entry.initData) : null;
       const following = current === null ? undefined : next.get(current);
       const initData = following === undefined ? null : sinfWithKeyId(entry.initData, following);
-      if (initData) requests.push(initData);
+      const eligible = entry.partition === partition && entry.usable && entry.initDataType === 'sinf';
+      note?.(`prelicense: session type=${entry.initDataType} bytes=${entry.initData.byteLength} partition=${entry.partition === partition ? 'same' : 'other'}`
+        + ` usable=${entry.usable} ahead=${entry.prelicensed === true} kid=${current ?? 'not found'} successor=${following ?? 'none'}`
+        + ` request=${initData ? 'built' : 'none'} head=${hex((sinfBoxes(entry.initData)?.[0] ?? entry.initData).subarray(0, 24))}`);
+      if (eligible && initData) requests.push(initData);
     }
     let licensed = 0;
     for (const initData of requests) if (await this.prelicense(drm, 'sinf', initData, options)) licensed++;
@@ -461,14 +467,24 @@ function childBox(bytes: Uint8Array, from: number, to: number, type: string): [n
   return null;
 }
 
-/** Offset of `tenc`'s default_KID in a `sinf` box (sinf > schi > tenc), or -1. */
+/**
+ * Offset of `tenc`'s default_KID in FairPlay `sinf` bytes, or -1. By box
+ * boundaries when the bytes are a sinf box (sinf > schi > tenc, or tenc
+ * directly under sinf); otherwise, as browsers hand these bytes over in more
+ * than one shape, the first `tenc` type found.
+ */
 function tencKidOffset(sinf: Uint8Array): number {
   const outer = childBox(sinf, 0, sinf.byteLength, 'sinf');
   const schi = outer && childBox(sinf, outer[0], outer[1], 'schi');
-  // Some sources give the sinf's children without the schi wrapper.
   const tenc = outer && (schi ? childBox(sinf, schi[0], schi[1], 'tenc') : childBox(sinf, outer[0], outer[1], 'tenc'));
   // FullBox header (4), reserved and pattern (2), isProtected (1), IV size (1), then the KID.
-  return tenc && tenc[0] + 8 + 16 <= tenc[1] ? tenc[0] + 8 : -1;
+  if (tenc) return tenc[0] + 8 + 16 <= tenc[1] ? tenc[0] + 8 : -1;
+  for (let i = 4; i + 4 <= sinf.byteLength; i++) {
+    if (sinf[i] === 0x74 && sinf[i + 1] === 0x65 && sinf[i + 2] === 0x6e && sinf[i + 3] === 0x63) {
+      return i + 12 + 16 <= sinf.byteLength ? i + 12 : -1;
+    }
+  }
+  return -1;
 }
 
 /** @internal The key ID (`tenc` default_KID, lowercase hex) FairPlay `sinf` initialization data names. */
